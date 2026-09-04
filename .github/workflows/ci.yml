@@ -5,6 +5,7 @@ on:
     branches: [main, pr-312-fix]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
