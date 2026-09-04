@@ -23,6 +23,7 @@ import {
   type StairSurfaceMaterialRole,
   sceneRegistry,
   useLiveNodeOverrides,
+  useRegistryVersion,
   useScene,
 } from '@pascal-app/core'
 
@@ -38,10 +39,14 @@ import { type BufferGeometry, Color, type Material, type Mesh, type Object3D, Ve
 import {
   canDirectMoveNode,
   canDirectRotateNode,
+  pointerEventHitsEditorHandle,
+  resolveDirectManipulationNode,
   resolveDirectRotationDragDelta,
   resolveDirectRotationPatch,
+  shouldStartDirectMoveDrag,
 } from '../../lib/direct-manipulation'
 import { createEditorApi } from '../../lib/editor-api'
+import { selectionEnabled } from '../../lib/interaction/scope'
 import {
   type ActivePaintMaterial,
   buildRoofSegmentSurfaceMaterialPatch,
@@ -782,6 +787,12 @@ export const SelectionManager = () => {
 
   const movingNode = useMovingNode()
   const isCurveReshape = useIsCurveReshape()
+  // Plugin kinds register AFTER mount (async dynamic-import discovery), so
+  // every effect below that snapshots `getSelectableKinds()` into an emitter
+  // subscription list depends on this version — a late plugin load re-runs
+  // them and picks up the new kinds (hover / click / double-click / paint /
+  // pointerdown). Without it, plugin nodes select-but-never-hover in prod.
+  const registryVersion = useRegistryVersion()
 
   useEffect(() => {
     const nextHoverMode: HoverHighlightMode = mode === 'delete' ? 'delete' : 'default'
@@ -793,6 +804,8 @@ export const SelectionManager = () => {
   }, [mode, setHoverHighlightMode])
 
   useEffect(() => {
+    // re-subscribe when plugin kinds register after mount (async plugin load)
+    void registryVersion
     if (mode !== 'material-paint') return
     if (movingNode || isCurveReshape) return
 
@@ -1188,7 +1201,7 @@ export const SelectionManager = () => {
       setHoverHighlightMode('default')
       useEditor.getState().setPaintHover(null)
     }
-  }, [isCurveReshape, mode, movingNode, setHoverHighlightMode])
+  }, [isCurveReshape, mode, movingNode, setHoverHighlightMode, registryVersion])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1224,12 +1237,16 @@ export const SelectionManager = () => {
   }, [])
 
   useEffect(() => {
+    // re-subscribe when plugin kinds register after mount (async plugin load)
+    void registryVersion
     if (mode !== 'select') return
     if (movingNode || isCurveReshape) return
 
     const onPointerDown = (event: NodeEvent) => {
+      if (!selectionEnabled(useInteractionScope.getState().scope)) return
       const pointer = pointerEventFromNodeEvent(event)
       if (pointer.button !== 0) return
+      const handleOwnsPointer = pointerEventHitsEditorHandle(event.nativeEvent)
 
       // Plain press on a transformable member of a multi-selection arms the
       // group move — dragging slides the whole selection on the ground plane
@@ -1237,6 +1254,7 @@ export const SelectionManager = () => {
       // group-move gizmo cross). A plain click (no drag) still falls through
       // to the normal click handling, which collapses to the pressed node.
       if (
+        !handleOwnsPointer &&
         !(pointer.shiftKey || pointer.altKey || isCommandModifier(pointer)) &&
         armGroupMove3d({
           nodeId: event.node.id as AnyNodeId,
@@ -1252,8 +1270,6 @@ export const SelectionManager = () => {
         return
       }
 
-      if (!isCommandModifier(pointer)) return
-
       const eventNode = useScene.getState().nodes[event.node.id as AnyNodeId] ?? event.node
       const node = resolveCanvasSelectionNode({
         node: eventNode,
@@ -1261,18 +1277,26 @@ export const SelectionManager = () => {
         selectedIds: useViewer.getState().selection.selectedIds,
       })
       if (!canDirectMoveNode(node)) return
-      // Sole selection only: per-node direct manipulation stands down for a
-      // multi-selection (the group sessions own plain drags there, and Cmd is
-      // the selection-toggle key — a wobbly Cmd+click must not yank one
-      // member out of the group).
       const currentSelectedIds = useViewer.getState().selection.selectedIds
-      if (currentSelectedIds.length !== 1 || currentSelectedIds[0] !== node.id) return
+      const allowPlainDrag = nodeRegistry.get(node.type)?.capabilities?.movable?.directDrag === true
+      if (
+        !shouldStartDirectMoveDrag({
+          allowPlainDrag,
+          commandModifier: isCommandModifier(pointer),
+          handleOwnsPointer,
+          nodeId: node.id,
+          selectedIds: currentSelectedIds,
+        })
+      ) {
+        return
+      }
 
       const startX = pointer.clientX
       const startY = pointer.clientY
       const pointerId = pointer.pointerId
       const pointerTarget = pointer.target instanceof EventTarget ? pointer.target : null
       let engaged = false
+      let engagedTargetId: AnyNodeId | null = null
 
       const cleanup = () => {
         window.removeEventListener('pointermove', onMove)
@@ -1294,8 +1318,9 @@ export const SelectionManager = () => {
         useViewer.getState().setInputDragging(true)
         swallowNextClick()
         createEditorApi().engageMoveDrag(node)
+        engagedTargetId = (getMovingNode()?.id as AnyNodeId | undefined) ?? null
         requestAnimationFrame(() => {
-          if (getMovingNode()?.id !== node.id) return
+          if (!getMovingNode()) return
           pointerTarget?.dispatchEvent(
             new PointerEvent('pointermove', {
               altKey: moveEvent.altKey,
@@ -1319,7 +1344,7 @@ export const SelectionManager = () => {
         if (engaged) {
           requestAnimationFrame(() => {
             const editor = useEditor.getState()
-            if (getMovingNode()?.id !== node.id || !editor.placementDragMode) return
+            if (getMovingNode()?.id !== engagedTargetId || !editor.placementDragMode) return
             editor.setMovingNode(null)
           })
         }
@@ -1363,7 +1388,7 @@ export const SelectionManager = () => {
         emitter.off(`${type}:pointerdown` as any, onPointerDown as any)
       }
     }
-  }, [isCurveReshape, mode, movingNode, camera, raycaster, glDomElement])
+  }, [isCurveReshape, mode, movingNode, camera, raycaster, glDomElement, registryVersion])
 
   // Move cursor over the selected movable node: the visual cue that clicking it
   // picks it up (replaces the removed move-cross gizmo). Reacts only when the
@@ -1381,7 +1406,7 @@ export const SelectionManager = () => {
       if (key === prevKey) return
       prevKey = key
       let wantsMove = false
-      if (hoveredId && !getMovingNode()) {
+      if (hoveredId && !getMovingNode() && selectionEnabled(useInteractionScope.getState().scope)) {
         if (sole === hoveredId) {
           const node = useScene.getState().nodes[sole as AnyNodeId]
           wantsMove = !!node && canDirectMoveNode(node)
@@ -1529,6 +1554,8 @@ export const SelectionManager = () => {
   }, [isCurveReshape, mode, movingNode])
 
   useEffect(() => {
+    // re-subscribe when plugin kinds register after mount (async plugin load)
+    void registryVersion
     if (mode !== 'select') return
     if (movingNode || isCurveReshape) return
 
@@ -1544,6 +1571,7 @@ export const SelectionManager = () => {
       // body click so only the reshape tool handles the release. (Scoped to
       // `endpoint`: hole-edit relies on node clicks to exit, just below.)
       const activeScope = useInteractionScope.getState().scope
+      if (activeScope.kind === 'mesh-editing') return
       if (activeScope.kind === 'reshaping' && activeScope.reshape === 'endpoint') return
 
       if (dispatchSceneAction(event.node, getEventObject(event))) {
@@ -1642,9 +1670,16 @@ export const SelectionManager = () => {
         const hasModifier = nativeEvent.shiftKey || isCommandModifier(nativeEvent)
         const isAlreadySole =
           selectedIdsBeforeRouting.length === 1 && selectedIdsBeforeRouting[0] === nodeToSelect.id
-        if (!hasModifier && isAlreadySole && !getMovingNode() && canDirectMoveNode(nodeToSelect)) {
+        if (
+          useEditor.getState().mode !== 'delete' &&
+          !hasModifier &&
+          isAlreadySole &&
+          !getMovingNode() &&
+          canDirectMoveNode(nodeToSelect)
+        ) {
           sfxEmitter.emit('sfx:item-pick')
-          useEditor.getState().setMovingNode(nodeToSelect as never)
+          const moveTarget = resolveDirectManipulationNode(nodeToSelect, useScene.getState().nodes)
+          useEditor.getState().setMovingNode(moveTarget as never)
           useViewer.getState().setSelection({ selectedIds: [] })
           return
         }
@@ -1760,6 +1795,7 @@ export const SelectionManager = () => {
     const onGridClick = (event: GridEvent) => {
       if (clickHandledRef.current) return
       if (boxSelectHandled) return
+      if (useInteractionScope.getState().scope.kind === 'mesh-editing') return
       const nativeEvent = event.nativeEvent
       if (nativeEvent?.metaKey || nativeEvent?.ctrlKey || nativeEvent?.shiftKey) return
       const { phase, structureLayer } = useEditor.getState()
@@ -1781,14 +1817,17 @@ export const SelectionManager = () => {
       })
       emitter.off('grid:click', onGridClick)
     }
-  }, [isCurveReshape, mode, movingNode])
+  }, [isCurveReshape, mode, movingNode, registryVersion])
 
   // Global double-click handler for auto-switching phases and cross-phase hover
   useEffect(() => {
+    // re-subscribe when plugin kinds register after mount (async plugin load)
+    void registryVersion
     if (mode !== 'select') return
     if (movingNode || isCurveReshape) return
 
     const onEnter = (event: NodeEvent) => {
+      if (useInteractionScope.getState().scope.kind === 'mesh-editing') return
       // A host-driven drag (handle resize/rotate, box-select) sets
       // `inputDragging`. useNodeEvents still emits hover events during it so
       // surface move tools keep tracking — but the select-hover outline must
@@ -1837,6 +1876,7 @@ export const SelectionManager = () => {
     }
 
     const onDoubleClick = (event: NodeEvent) => {
+      if (useInteractionScope.getState().scope.kind === 'mesh-editing') return
       let node = resolveCanvasSelectionNode({
         node: resolveSelectModeNodeTarget(event),
         nodes: useScene.getState().nodes,
@@ -1936,10 +1976,12 @@ export const SelectionManager = () => {
         emitter.off(`${type}:double-click` as any, onDoubleClick as any)
       })
     }
-  }, [isCurveReshape, mode, movingNode])
+  }, [isCurveReshape, mode, movingNode, registryVersion])
 
   // Delete mode: click-to-delete (sledgehammer tool)
   useEffect(() => {
+    // re-subscribe when plugin kinds register after mount (async plugin load)
+    void registryVersion
     if (mode !== 'delete') return
 
     const onClick = (event: NodeEvent) => {
@@ -2012,7 +2054,7 @@ export const SelectionManager = () => {
       }
       useViewer.setState({ hoveredId: null })
     }
-  }, [mode])
+  }, [mode, registryVersion])
 
   return (
     <>

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { CollectionId } from '../schema/collections'
+import type { SceneMaterialId } from '../schema/scene-material'
 import type { AnyNode, AnyNodeId } from '../schema/types'
 import {
   cloneLevelSubtree,
@@ -46,9 +47,48 @@ function makeSceneGraph(): SceneGraph {
         nodeIds: ['scan_1', 'guide_1'] as AnyNodeId[],
       },
     },
+    materials: {
+      ['mat_1' as SceneMaterialId]: {
+        id: 'mat_1',
+        name: 'Oak',
+        material: { preset: 'wood' },
+      },
+    },
     installedPlugins: ['pascal:trees'],
   }
 }
+
+describe('scene material palette', () => {
+  // Nodes reference materials through `slots` values shaped `scene:mat_…`.
+  // Those are opaque strings to the node remapping, so the ids they point at
+  // have to survive a clone unchanged or every reference dangles.
+  test('cloneSceneGraph carries materials over with their ids intact', () => {
+    const source = makeSceneGraph()
+    const cloned = cloneSceneGraph(source)
+
+    expect(cloned.materials).toEqual(source.materials)
+  })
+
+  test('cloneSceneGraph deep-copies materials', () => {
+    const source = makeSceneGraph()
+    const cloned = cloneSceneGraph(source)
+    const material = cloned.materials?.['mat_1' as SceneMaterialId]
+    expect(material).toBeDefined()
+    if (!material) return
+
+    material.name = 'Mutated'
+    expect(source.materials?.['mat_1' as SceneMaterialId]?.name).toBe('Oak')
+  })
+
+  // A palette entry is authored content in its own right. Stripping the scan
+  // node that happened to use it must not take the material with it.
+  test('forkSceneGraph keeps materials when stripping scans', () => {
+    const source = makeSceneGraph()
+    const forked = forkSceneGraph(source)
+
+    expect(forked.materials).toEqual(source.materials)
+  })
+})
 
 describe('forkSceneGraph', () => {
   test('strips scan and guide nodes by default', () => {
@@ -193,5 +233,98 @@ describe('supportSlabId remap', () => {
     const clonedExternal = clonedNodes.find((node) => node.id === idMap.get('item_2'))!
     expect((clonedHosted as { supportSlabId?: string }).supportSlabId).toBe(idMap.get('slab_1')!)
     expect((clonedExternal as { supportSlabId?: string }).supportSlabId).toBe('slab_external')
+  })
+})
+
+describe('lean-to roof attachment remap', () => {
+  test('remaps both host roof references in whole-scene and level clones', () => {
+    const level = makeNode('level_1', 'level', {
+      children: ['roof_1', 'leanto_1'],
+    })
+    const roof = makeNode('roof_1', 'roof', {
+      parentId: 'level_1',
+      children: ['roofseg_1'],
+    })
+    const segment = makeNode('roofseg_1', 'roof-segment', {
+      parentId: 'roof_1',
+    })
+    const leanTo = makeNode('leanto_1', 'lean-to-extension', {
+      parentId: 'level_1',
+      hostRoofId: 'roof_1',
+      hostRoofSegmentId: 'roofseg_1',
+    })
+    const nodes = {
+      ['level_1' as AnyNodeId]: level,
+      ['roof_1' as AnyNodeId]: roof,
+      ['roofseg_1' as AnyNodeId]: segment,
+      ['leanto_1' as AnyNodeId]: leanTo,
+    }
+
+    const whole = cloneSceneGraph({ nodes, rootNodeIds: ['level_1' as AnyNodeId] })
+    const wholeRoof = Object.values(whole.nodes).find((node) => node.type === 'roof')!
+    const wholeSegment = Object.values(whole.nodes).find((node) => node.type === 'roof-segment')!
+    const wholeLeanTo = Object.values(whole.nodes).find(
+      (node) => node.type === 'lean-to-extension',
+    )! as unknown as { hostRoofId: string; hostRoofSegmentId: string }
+    expect(wholeLeanTo.hostRoofId).toBe(wholeRoof.id)
+    expect(wholeLeanTo.hostRoofSegmentId).toBe(wholeSegment.id)
+
+    const levelClone = cloneLevelSubtree(nodes, 'level_1' as AnyNodeId)
+    const levelLeanTo = levelClone.clonedNodes.find(
+      (node) => node.type === 'lean-to-extension',
+    )! as unknown as { hostRoofId: string; hostRoofSegmentId: string }
+    expect(levelLeanTo.hostRoofId).toBe(levelClone.idMap.get('roof_1'))
+    expect(levelLeanTo.hostRoofSegmentId).toBe(levelClone.idMap.get('roofseg_1'))
+  })
+})
+
+describe('roof surface support remap', () => {
+  test('remaps a mounted roof support segment in whole-scene and level clones', () => {
+    const level = makeNode('level_1', 'level', {
+      children: ['roof_host', 'roof_mounted'],
+    })
+    const host = makeNode('roof_host', 'roof', {
+      parentId: 'level_1',
+      children: ['rseg_host'],
+    })
+    const hostSegment = makeNode('rseg_host', 'roof-segment', {
+      parentId: 'roof_host',
+    })
+    const mounted = makeNode('roof_mounted', 'roof', {
+      parentId: 'level_1',
+      support: {
+        kind: 'roof',
+        roofSegmentId: 'rseg_host',
+        localPosition: [1, 2],
+        curbHeight: 0.5,
+      },
+    })
+    const nodes = {
+      ['level_1' as AnyNodeId]: level,
+      ['roof_host' as AnyNodeId]: host,
+      ['rseg_host' as AnyNodeId]: hostSegment,
+      ['roof_mounted' as AnyNodeId]: mounted,
+    }
+
+    const whole = cloneSceneGraph({ nodes, rootNodeIds: ['level_1' as AnyNodeId] })
+    const wholeHostSegment = Object.values(whole.nodes).find(
+      (node) => node.type === 'roof-segment',
+    )!
+    const wholeMounted = Object.values(whole.nodes).find(
+      (node) => node.type === 'roof' && node.support?.kind === 'roof',
+    )!
+    expect(wholeMounted.type).toBe('roof')
+    if (wholeMounted.type === 'roof' && wholeMounted.support.kind === 'roof') {
+      expect(wholeMounted.support.roofSegmentId).toBe(wholeHostSegment.id)
+    }
+
+    const levelClone = cloneLevelSubtree(nodes, 'level_1' as AnyNodeId)
+    const levelMounted = levelClone.clonedNodes.find(
+      (node) => node.type === 'roof' && node.support?.kind === 'roof',
+    )!
+    expect(levelMounted.type).toBe('roof')
+    if (levelMounted.type === 'roof' && levelMounted.support.kind === 'roof') {
+      expect(levelMounted.support.roofSegmentId).toBe(levelClone.idMap.get('rseg_host'))
+    }
   })
 })

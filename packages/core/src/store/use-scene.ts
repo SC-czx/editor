@@ -8,9 +8,15 @@ import { getNodePluginId, isNodeKindEnabled, nodeRegistry } from '../registry/re
 import { BuildingNode } from '../schema'
 import type { Collection, CollectionId } from '../schema/collections'
 import { generateCollectionId } from '../schema/collections'
+import { compiledNodeSchema } from '../schema/compiled-node-parsers'
 import { DoorNode as DoorNodeSchema } from '../schema/nodes/door'
+import {
+  createDormerDefaultWindow,
+  DormerNode as DormerNodeSchema,
+  getDormerDefaultWindowFace,
+} from '../schema/nodes/dormer'
 import { ElevatorNode as ElevatorNodeSchema } from '../schema/nodes/elevator'
-import { LevelNode } from '../schema/nodes/level'
+import { LevelNode, normalizeLevelBaseElevation } from '../schema/nodes/level'
 import {
   getPitchFromActiveRoofHeight,
   type RoofSegmentNode,
@@ -32,12 +38,9 @@ import {
   type SceneMaterialId,
 } from '../schema/scene-material'
 import { type AnyNode, type AnyNodeId, AnyNode as AnyNodeSchema } from '../schema/types'
-import { deriveLegacyLevelHeight } from '../services/level-height'
-import { getCeilingClampBound } from '../services/storey'
-import { computeWallSlabSupport } from '../systems/slab/slab-support'
-import { DEFAULT_WALL_HEIGHT } from '../systems/wall/wall-footprint'
 import { healSceneNodes } from '../utils/heal-scene-graph'
 import { removeRetiredDrawingSheetNodes } from '../utils/retired-scene-nodes'
+import { migrateVerticalSceneNodes } from '../utils/vertical-scene-migration'
 import * as nodeActions from './actions/node-actions'
 import {
   areSceneSnapshotsEqual,
@@ -122,7 +125,7 @@ function normalizeStairNode(node: Record<string, unknown>) {
     children: getStringArray(node.children),
   }
 
-  const parsed = StairNodeSchema.safeParse(sanitized)
+  const parsed = compiledNodeSchema(StairNodeSchema).safeParse(sanitized)
   if (!parsed.success) return null
   if (hasTotalRise) return parsed.data
   // Absent `totalRise` means "rise derives from the storey height" and must
@@ -147,12 +150,12 @@ function normalizeStairSegmentNode(node: Record<string, unknown>) {
     thickness: getFiniteNumber(node.thickness, 0.25),
   }
 
-  const parsed = StairSegmentNodeSchema.safeParse(sanitized)
+  const parsed = compiledNodeSchema(StairSegmentNodeSchema).safeParse(sanitized)
   return parsed.success ? parsed.data : null
 }
 
 function normalizeDoorNode(node: Record<string, unknown>) {
-  const parsed = DoorNodeSchema.safeParse(node)
+  const parsed = compiledNodeSchema(DoorNodeSchema).safeParse(node)
   return parsed.success ? { ...node, ...parsed.data } : null
 }
 
@@ -160,7 +163,7 @@ function normalizeDoorNode(node: Record<string, unknown>) {
 // `frameThickness`) load without it; the mesh builder then reads undefined and
 // throws every frame. Zod-parse on load so schema defaults land, like doors.
 function normalizeWindowNode(node: Record<string, unknown>) {
-  const parsed = WindowNodeSchema.safeParse(node)
+  const parsed = compiledNodeSchema(WindowNodeSchema).safeParse(node)
   return parsed.success ? { ...node, ...parsed.data } : null
 }
 
@@ -191,7 +194,7 @@ function normalizeShelfNode(node: Record<string, unknown>) {
     ),
   }
 
-  const parsed = ShelfNodeSchema.safeParse(sanitized)
+  const parsed = compiledNodeSchema(ShelfNodeSchema).safeParse(sanitized)
   return parsed.success ? parsed.data : null
 }
 
@@ -220,7 +223,7 @@ function normalizeElevatorNode(node: Record<string, unknown>) {
     dwellMs: getFiniteNumber(node.dwellMs, 1400),
   }
 
-  const parsed = ElevatorNodeSchema.safeParse(sanitized)
+  const parsed = compiledNodeSchema(ElevatorNodeSchema).safeParse(sanitized)
   return parsed.success ? parsed.data : null
 }
 
@@ -382,6 +385,50 @@ function migrateSingleMaterialSlots(
   for (const slotId of slotIds) slots[slotId] = ref
 
   return { ...node, slots, material: undefined, materialPreset: undefined }
+}
+
+function migrateRoleMaterialSlots(
+  node: Record<string, any>,
+  roles: readonly string[],
+  mintedMaterials: Record<SceneMaterialId, SceneMaterial>,
+) {
+  const slots: Record<string, string> = { ...(node.slots ?? {}) }
+  const next = { ...node }
+  let changed = false
+
+  for (const role of roles) {
+    if (slots[role] === undefined) {
+      const ref = legacySpecToMaterialRef(
+        {
+          material: node[`${role}Material`] ?? node.material,
+          materialPreset: node[`${role}MaterialPreset`] ?? node.materialPreset,
+        },
+        mintedMaterials,
+      )
+      if (ref) {
+        slots[role] = ref
+        changed = true
+      }
+    }
+    if (`${role}Material` in next || `${role}MaterialPreset` in next) changed = true
+    delete next[`${role}Material`]
+    delete next[`${role}MaterialPreset`]
+  }
+
+  return changed ? { ...next, slots } : node
+}
+
+function migrateRenamedSlot(node: Record<string, any>, previousId: string, nextId: string) {
+  if (!node.slots || node.slots[previousId] === undefined) return node
+  const slots = { ...node.slots }
+  if (slots[nextId] === undefined) slots[nextId] = slots[previousId]
+  delete slots[previousId]
+  return { ...node, slots }
+}
+
+function migrateCupolaLouverSlot(node: Record<string, any>) {
+  if (!node.slots || node.slots.louvers !== undefined || node.slots.body === undefined) return node
+  return { ...node, slots: { ...node.slots, louvers: node.slots.body } }
 }
 
 // Stair carries per-role legacy fields (`treadMaterial*` / `sideMaterial*` /
@@ -608,14 +655,49 @@ function migrateWallAssembly(node: Record<string, any>) {
   return assemblyThickness > 0 ? { ...wall, thickness: assemblyThickness } : wall
 }
 
-// Walls whose top lands within this of the storey plane become plane-bound;
-// ceilings whose stored height lands within this of their clamp bound become
-// follows-mode (step 3f) — same census-backed threshold for both.
-// From a prod census: the 0.15-short "hole pattern" (default 2.5 walls next to
-// a taller wall) must snap to the plane, while intentional 0.20-short walls
-// (2.5 under a 2.7 plane, 2.3 under a 2.5 plane) must keep their explicit
-// height — hence 0.20 with a strictly-less-than comparison.
-const PLANE_BOUND_EPSILON = 0.2
+function migrateBlockRename(
+  id: string,
+  node: Record<string, any>,
+  nodes: Record<string, any>,
+): [string, Record<string, any>] {
+  if (node.type !== 'custom-mesh') return [id, node]
+
+  const desiredId = id.startsWith('custom-mesh_') ? `block_${id.slice('custom-mesh_'.length)}` : id
+  let nextId = desiredId
+  let suffix = 1
+  while (nextId !== id && nodes[nextId]) {
+    nextId = `${desiredId}_${suffix}`
+    suffix += 1
+  }
+  const nextNode = { ...node, id: nextId, type: 'block' }
+
+  if (nextId !== id) {
+    for (const candidate of Object.values(nodes)) {
+      if (!candidate || typeof candidate !== 'object') continue
+      if (candidate.parentId === id) candidate.parentId = nextId
+      if (Array.isArray(candidate.children)) {
+        candidate.children = candidate.children.map((childId: unknown) =>
+          childId === id ? nextId : childId,
+        )
+      }
+    }
+  }
+
+  return [nextId, nextNode]
+}
+
+function migrateBlockHostedItem(node: Record<string, any>) {
+  if (
+    node.type !== 'item' ||
+    node.blockFaceId !== undefined ||
+    node.customMeshFaceId === undefined
+  ) {
+    return node
+  }
+
+  const { customMeshFaceId, ...item } = node
+  return { ...item, blockFaceId: customMeshFaceId }
+}
 
 function migrateNodes(nodes: Record<string, any>): {
   nodes: Record<string, AnyNode>
@@ -629,6 +711,14 @@ function migrateNodes(nodes: Record<string, any>): {
   // Scene materials minted while moving legacy wall fields onto `node.slots`;
   // merged into the scene material map by the caller (`setScene`).
   const mintedMaterials: Record<SceneMaterialId, SceneMaterial> = {}
+
+  for (const [id, node] of Object.entries(patchedNodes)) {
+    const [nextId, nextNode] = migrateBlockRename(id, node, patchedNodes)
+    if (nextId !== id) {
+      delete patchedNodes[id]
+    }
+    patchedNodes[nextId] = migrateBlockHostedItem(nextNode)
+  }
 
   // Pass 1: all node types except elevator.
   // Elevator migration (migrateElevatorParent) mutates level.children to remove
@@ -725,6 +815,40 @@ function migrateNodes(nodes: Record<string, any>): {
       }
     }
 
+    // Dormers originally rendered one inline parametric window. Promote that
+    // default to a real hosted WindowNode so additional windows can use the
+    // regular window tool and inspector without changing the old appearance.
+    if (node.type === 'dormer') {
+      const hasLegacyInlineWindow = !Array.isArray(
+        (patchedNodes[id] as { children?: unknown }).children,
+      )
+      if (!hasLegacyInlineWindow) continue
+      const dormer = DormerNodeSchema.parse({
+        ...patchedNodes[id],
+        children: getStringArray((patchedNodes[id] as { children?: unknown }).children),
+      })
+      const children = getStringArray(dormer.children)
+      const hasHostedWindow = children.some((childId) => patchedNodes[childId]?.type === 'window')
+      if (!hasHostedWindow) {
+        const baseWindowId = `window_${id.replace(/^dormer_/, '')}_default`
+        let windowId = baseWindowId
+        let suffix = 1
+        while (patchedNodes[windowId]) {
+          windowId = `${baseWindowId}_${suffix}`
+          suffix += 1
+        }
+        const host = dormer.roofSegmentId ? patchedNodes[dormer.roofSegmentId] : undefined
+        const hostSegment = host?.type === 'roof-segment' ? (host as RoofSegmentNode) : undefined
+        const window = createDormerDefaultWindow(
+          dormer,
+          windowId,
+          getDormerDefaultWindowFace(dormer, hostSegment),
+        )
+        patchedNodes[windowId] = window
+        patchedNodes[id] = { ...dormer, children: [...children, window.id] }
+      }
+    }
+
     if (node.type === 'construction-dimension') {
       patchedNodes[id] = migrateConstructionDimension(node)
     }
@@ -794,6 +918,48 @@ function migrateNodes(nodes: Record<string, any>): {
       patchedNodes[id] = migrateSingleMaterialSlots(
         patchedNodes[id],
         ['shaft', 'base', 'capital', 'frame'],
+        mintedMaterials,
+      )
+    }
+
+    if (node.type === 'gutter') {
+      patchedNodes[id] = migrateRenamedSlot(patchedNodes[id], 'surface', 'gutter')
+      patchedNodes[id] = migrateSingleMaterialSlots(patchedNodes[id], ['gutter'], mintedMaterials)
+    }
+
+    if (node.type === 'downspout') {
+      patchedNodes[id] = migrateSingleMaterialSlots(patchedNodes[id], ['surface'], mintedMaterials)
+    }
+
+    if (node.type === 'box-vent') {
+      patchedNodes[id] = migrateRoleMaterialSlots(
+        patchedNodes[id],
+        ['base', 'top'],
+        mintedMaterials,
+      )
+    }
+
+    if (node.type === 'cupola') {
+      patchedNodes[id] = migrateCupolaLouverSlot(patchedNodes[id])
+      patchedNodes[id] = migrateRoleMaterialSlots(
+        patchedNodes[id],
+        ['base', 'body', 'roof', 'louvers'],
+        mintedMaterials,
+      )
+    }
+
+    if (node.type === 'eyebrow-vent') {
+      patchedNodes[id] = migrateRoleMaterialSlots(
+        patchedNodes[id],
+        ['hood', 'front'],
+        mintedMaterials,
+      )
+    }
+
+    if (node.type === 'turbine-vent') {
+      patchedNodes[id] = migrateRoleMaterialSlots(
+        patchedNodes[id],
+        ['base', 'head'],
         mintedMaterials,
       )
     }
@@ -928,6 +1094,7 @@ function migrateNodes(nodes: Record<string, any>): {
       const levelNumber = getFiniteNumber(node.level, 0)
       patchedNodes[id] = {
         ...node,
+        baseElevation: normalizeLevelBaseElevation(node.baseElevation),
         level: levelNumber,
         children: validChildren,
       }
@@ -951,170 +1118,8 @@ function migrateNodes(nodes: Record<string, any>): {
     }
   }
 
-  // Pass 3: vertical building model.
-  // A level without `height` marks a scene saved before the vertical model
-  // landed. Computed before this pass mutates anything: the stair-rise
-  // cleanup below must never run on already-migrated scenes.
-  const isLegacyScene = Object.values(patchedNodes).some(
-    (node) => node?.type === 'level' && !('height' in node),
-  )
-
-  // 3a. Ordinal renumber — always runs, per building (idempotent
-  // self-healing; MCP's create-level historically wrote its elevation PARAM
-  // into the ordinal, so fractional/duplicate ordinals exist in the wild).
-  const buildingNodes = Object.values(patchedNodes).filter((node) => node?.type === 'building')
-  const levelsByBuilding = new Map<string | null, Array<{ id: string; ordinal: number }>>()
-  for (const [id, node] of Object.entries(patchedNodes)) {
-    if (node?.type !== 'level') continue
-    // Mirrors the building resolution in services/storey.ts: an explicit
-    // parentId pointing at a building wins, membership in a building's
-    // children array is the legacy fallback, and unresolvable levels share
-    // one orphan bucket.
-    const buildingId =
-      buildingNodes.find((building) => building.id === node.parentId)?.id ??
-      buildingNodes.find((building) => getStringArray(building.children).includes(id))?.id ??
-      null
-    const bucket = levelsByBuilding.get(buildingId) ?? []
-    bucket.push({ id, ordinal: getFiniteNumber(node.level, 0) })
-    levelsByBuilding.set(buildingId, bucket)
-  }
-  for (const bucket of levelsByBuilding.values()) {
-    // Anchored at zero on purpose: ordinals are semantic — `level < 0`
-    // renders "Basement N" and `level === 0` is the ground-floor default —
-    // so negatives compact upward toward −1 and non-negatives compact down
-    // to 0. A blind 0..n renumber would rename basements.
-    const sorted = [...bucket].sort((a, b) => a.ordinal - b.ordinal)
-    const negativeCount = sorted.filter((entry) => entry.ordinal < 0).length
-    sorted.forEach((entry, index) => {
-      const nextOrdinal = index - negativeCount
-      const current = patchedNodes[entry.id]
-      if (current.level !== nextOrdinal) {
-        patchedNodes[entry.id] = { ...current, level: nextOrdinal }
-      }
-    })
-  }
-
-  // 3b. Stored storey heights: materialize the legacy stacked height verbatim
-  // (never rounded or snapped — snapping would move existing buildings).
-  // All planes derive before any wall height below mutates.
-  const legacyLevelIds = Object.entries(patchedNodes)
-    .filter(([, node]) => node?.type === 'level' && !('height' in node))
-    .map(([id]) => id)
-  const derivedHeights = new Map<string, number>()
-  for (const levelId of legacyLevelIds) {
-    derivedHeights.set(
-      levelId,
-      deriveLegacyLevelHeight(levelId, patchedNodes as Record<AnyNodeId, AnyNode>),
-    )
-  }
-
-  for (const levelId of legacyLevelIds) {
-    const plane = derivedHeights.get(levelId)!
-    const level = patchedNodes[levelId]
-    patchedNodes[levelId] = { ...level, height: plane }
-
-    // 3c. Wall-top classification against the just-written plane, using the
-    // same slab-support election as deriveLegacyLevelHeight (call shape
-    // mirrored from services/level-height.ts). Walls whose top meets the
-    // plane drop their explicit height and follow the level from now on;
-    // walls ending short (or tall) keep an explicit height — materializing
-    // the 2.5 default onto absent-height walls that end short of the plane.
-    const children = getStringArray(level.children)
-      .map((childId) => patchedNodes[childId])
-      .filter((child) => child !== undefined)
-    const slabs = children.filter((child) => child.type === 'slab')
-    const walls = children.filter((child) => child.type === 'wall')
-    for (const wall of walls) {
-      const electedBase = computeWallSlabSupport(
-        {
-          start: wall.start,
-          end: wall.end,
-          curveOffset: wall.curveOffset,
-          thickness: wall.thickness,
-        },
-        slabs,
-        walls,
-      ).elevation
-      const effectiveHeight = wall.height ?? DEFAULT_WALL_HEIGHT
-      const top = Math.max(0, electedBase) + effectiveHeight
-      if (Math.abs(plane - top) < PLANE_BOUND_EPSILON) {
-        if ('height' in wall) {
-          const { height: _height, ...planeBound } = wall
-          patchedNodes[wall.id] = planeBound
-        }
-      } else {
-        patchedNodes[wall.id] = { ...wall, height: effectiveHeight }
-      }
-    }
-  }
-
-  // 3d. Stair rise: on legacy scenes a totalRise of exactly 2.5 is the old
-  // schema default, not a user choice — drop it so the rise derives from the
-  // storey height. Gated on isLegacyScene because on a post-migration scene
-  // a stored 2.5 IS a deliberately typed value and must survive reloads.
-  if (isLegacyScene) {
-    for (const [id, node] of Object.entries(patchedNodes)) {
-      if (node?.type !== 'stair') continue
-      if (node.totalRise !== 2.5) continue
-      const { totalRise: _totalRise, ...derivedRise } = node
-      patchedNodes[id] = derivedRise
-    }
-  }
-
-  // 3e. Slab placement/thickness split. `elevation` stays the walking surface;
-  // the new `thickness` grows downward so the solid occupies
-  // [elevation − thickness, elevation]. Legacy solids extruded [0, elevation],
-  // so thickness = elevation EXACTLY (including degenerate 0 — MIN_SLAB_THICKNESS
-  // applies to edits only, never here) keeps the occupied interval identical.
-  // Legacy pools (elevation < 0) become explicit `recessed` intent with
-  // elevation unchanged. Gated per slab on a missing `thickness` — the
-  // migration output is cast, so schema defaults never materialize on load.
-  for (const [id, node] of Object.entries(patchedNodes)) {
-    if (node?.type !== 'slab' || 'thickness' in node) continue
-    const elevation = getFiniteNumber(node.elevation, 0.05)
-    patchedNodes[id] =
-      elevation < 0
-        ? { ...node, thickness: 0.05, recessed: true }
-        : { ...node, thickness: elevation }
-  }
-
-  // 3f. Ceiling follows-mode classification (the ceiling mirror of 3c; runs
-  // after 3b/3e so the clamp bound sees stored level heights and split slab
-  // thicknesses). A stored ceiling height within PLANE_BOUND_EPSILON of its
-  // clamp bound (min(storey plane, covering-slab underside) − margin, via
-  // getCeilingClampBound) is the legacy default tracking the level top, not
-  // a choice — drop it so the ceiling follows the level from now on.
-  // autoFromWalls ceilings always convert: their height was derived by the
-  // space-detection sync, never user intent. Gated on isLegacyScene, which
-  // is exact — nothing shipped between the level-height migration and this
-  // one — and makes the step idempotent. Known accepted edge: a
-  // post-migration user typing a custom height exactly equal to the bound
-  // keeps it (the gate prevents re-classification on later loads).
-  if (isLegacyScene) {
-    for (const [id, node] of Object.entries(patchedNodes)) {
-      if (node?.type !== 'ceiling' || !('height' in node)) continue
-      const dropHeight = () => {
-        const { height: _height, ...follows } = node
-        patchedNodes[id] = follows
-      }
-      if (node.autoFromWalls === true) {
-        dropHeight()
-        continue
-      }
-      if (typeof node.parentId !== 'string') continue
-      const bound = getCeilingClampBound(
-        node.parentId,
-        patchedNodes as Record<AnyNodeId, AnyNode>,
-        Array.isArray(node.polygon) ? node.polygon : [],
-      )
-      const stored = getFiniteNumber(node.height, Number.NaN)
-      if (Number.isFinite(bound) && Math.abs(stored - bound) < PLANE_BOUND_EPSILON) {
-        dropHeight()
-      }
-    }
-  }
-
-  return { nodes: patchedNodes as Record<string, AnyNode>, mintedMaterials }
+  const vertical = migrateVerticalSceneNodes(patchedNodes)
+  return { nodes: vertical.nodes as Record<string, AnyNode>, mintedMaterials }
 }
 
 function getNodeChildIds(node: AnyNode): AnyNodeId[] {
@@ -1261,7 +1266,80 @@ function sceneHistorySnapshotFromState(
   >,
 ): SceneSnapshot {
   const { nodes, rootNodeIds, collections, materials, installedPlugins } = state
-  return { nodes, rootNodeIds, collections, materials, installedPlugins }
+  // Fresh placement nodes are renderable drafts, not document history. Excluding their
+  // entire subtree here protects both local undo and external commit subscribers.
+  const transientNodeIds = new Set<AnyNodeId>()
+  for (const node of Object.values(nodes)) {
+    const metadata = node.metadata
+    if (
+      metadata &&
+      typeof metadata === 'object' &&
+      !Array.isArray(metadata) &&
+      (metadata as Record<string, unknown>).isNew === true
+    ) {
+      transientNodeIds.add(node.id)
+    }
+  }
+
+  if (transientNodeIds.size === 0) {
+    return { nodes, rootNodeIds, collections, materials, installedPlugins }
+  }
+
+  const childIdsByParentId = new Map<AnyNodeId, Set<AnyNodeId>>()
+  const addChild = (parentId: AnyNodeId, childId: AnyNodeId) => {
+    const childIds = childIdsByParentId.get(parentId) ?? new Set<AnyNodeId>()
+    childIds.add(childId)
+    childIdsByParentId.set(parentId, childIds)
+  }
+  for (const node of Object.values(nodes)) {
+    if (node.parentId) addChild(node.parentId as AnyNodeId, node.id)
+    for (const childId of getNodeChildIds(node)) addChild(node.id, childId)
+  }
+
+  const pendingIds = [...transientNodeIds]
+  while (pendingIds.length > 0) {
+    const parentId = pendingIds.pop()
+    if (!parentId) continue
+    for (const childId of childIdsByParentId.get(parentId) ?? []) {
+      if (transientNodeIds.has(childId)) continue
+      transientNodeIds.add(childId)
+      pendingIds.push(childId)
+    }
+  }
+
+  const historyNodes = {} as Record<AnyNodeId, AnyNode>
+  for (const [id, node] of Object.entries(nodes) as [AnyNodeId, AnyNode][]) {
+    if (transientNodeIds.has(id)) continue
+    if (!('children' in node && Array.isArray(node.children))) {
+      historyNodes[id] = node
+      continue
+    }
+    const children = (node.children as AnyNodeId[]).filter(
+      (childId) => !transientNodeIds.has(childId),
+    )
+    historyNodes[id] =
+      children.length === node.children.length ? node : ({ ...node, children } as AnyNode)
+  }
+
+  const historyCollections = {} as Record<CollectionId, Collection>
+  for (const [id, collection] of Object.entries(collections) as [CollectionId, Collection][]) {
+    const nodeIds = collection.nodeIds.filter((nodeId) => !transientNodeIds.has(nodeId))
+    if (collection.controlNodeId && transientNodeIds.has(collection.controlNodeId)) {
+      const { controlNodeId: _controlNodeId, ...rest } = collection
+      historyCollections[id] = { ...rest, nodeIds }
+    } else {
+      historyCollections[id] =
+        nodeIds.length === collection.nodeIds.length ? collection : { ...collection, nodeIds }
+    }
+  }
+
+  return {
+    nodes: historyNodes,
+    rootNodeIds: rootNodeIds.filter((id) => !transientNodeIds.has(id)),
+    collections: historyCollections,
+    materials,
+    installedPlugins,
+  }
 }
 
 const useScene: UseSceneStore = create<SceneState>()(

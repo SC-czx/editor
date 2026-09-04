@@ -18,6 +18,7 @@ import {
   useViewer,
   Viewer,
 } from '@pascal-app/viewer'
+import { Ruler } from 'lucide-react'
 import { memo, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import { ViewerOverlay } from '../../components/viewer-overlay'
 import { ViewerZoneSystem } from '../../components/viewer-zone-system'
@@ -31,6 +32,7 @@ import {
   writePersistedSelection,
 } from '../../lib/scene'
 import { disposeSFXBus, initSFXBus } from '../../lib/sfx-bus'
+import { type CameraHintAction, useCameraHintFocus } from '../../store/use-camera-hint-focus'
 import useEditor from '../../store/use-editor'
 import useFloorplanMode from '../../store/use-floorplan-mode'
 import useSessionGroups from '../../store/use-session-groups'
@@ -48,6 +50,7 @@ import { CommandPalette, type CommandPaletteEmptyAction } from '../ui/command-pa
 import { EditorCommands } from '../ui/command-palette/editor-commands'
 import { FloatingLevelSelector } from '../ui/floating-level-selector'
 import { HelperManager } from '../ui/helpers/helper-manager'
+import { LevelBatchDialogs } from '../ui/level-batch-dialogs'
 import { PanelManager } from '../ui/panels/panel-manager'
 import { ErrorBoundary } from '../ui/primitives/error-boundary'
 import { useSidebarStore } from '../ui/primitives/sidebar'
@@ -57,8 +60,12 @@ import { AppSidebar } from '../ui/sidebar/app-sidebar'
 import type { ExtraPanel } from '../ui/sidebar/icon-rail'
 import { SettingsPanel, type SettingsPanelProps } from '../ui/sidebar/panels/settings-panel'
 import { SitePanel, type SitePanelProps } from '../ui/sidebar/panels/site-panel'
+import { VerticalOverviewPanel } from '../ui/sidebar/panels/vertical-overview-panel'
 import type { SidebarTab } from '../ui/sidebar/tab-bar'
 import { useHostPanels } from '../ui/sidebar/use-plugin-panels'
+import { ViewerStage } from '../viewer/viewer-stage'
+import type { ViewerStageMode } from '../viewer/viewer-stage-modes'
+import { CaptureCameraRig } from './capture-camera-rig'
 import { CustomCameraControls } from './custom-camera-controls'
 import { DeleteConfirmationDialog } from './delete-confirmation-dialog'
 import { EditorLayoutV2 } from './editor-layout-v2'
@@ -86,6 +93,8 @@ import { WallMoveSideHandles } from './wall-move-side-handles'
 import { WallOpeningHighlights } from './wall-opening-highlights'
 
 const CAMERA_CONTROLS_HINT_DISMISSED_STORAGE_KEY = 'editor-camera-controls-hint-dismissed:v1'
+const PREVIEW_STAGE_SWITCHER_POSITION =
+  'top-28 right-4 left-auto translate-x-0 md:top-4 md:right-auto md:left-1/2 md:-translate-x-1/2'
 const DELETE_CURSOR_BADGE_COLOR = '#ef4444'
 const DELETE_CURSOR_BADGE_OFFSET_X = 14
 const DELETE_CURSOR_BADGE_OFFSET_Y = 14
@@ -376,7 +385,7 @@ type ShortcutKey = {
 }
 
 type CameraControlHint = {
-  action: string
+  action: CameraHintAction
   keys: ShortcutKey[]
   alternativeKeys?: ShortcutKey[]
 }
@@ -510,7 +519,15 @@ function ViewerCanvasControlsHint({
   isPreviewMode: boolean
   onDismiss: () => void
 }) {
-  const hints = isPreviewMode ? PREVIEW_CAMERA_CONTROL_HINTS : EDITOR_CAMERA_CONTROL_HINTS
+  const all = isPreviewMode ? PREVIEW_CAMERA_CONTROL_HINTS : EDITOR_CAMERA_CONTROL_HINTS
+  // A host teaching one gesture at a time narrows this to the one it is asking
+  // for, and to nothing once it is done. Null — the default — is all of them.
+  const focus = useCameraHintFocus((state) => state.actions)
+  const hints = focus === null ? all : all.filter((hint) => focus.includes(hint.action))
+
+  if (hints.length === 0) {
+    return null
+  }
 
   return (
     <div className="pointer-events-none absolute top-14 left-1/2 z-40 max-w-[calc(100%-2rem)] -translate-x-1/2">
@@ -518,7 +535,10 @@ function ViewerCanvasControlsHint({
         aria-label="Camera controls hint"
         className="pointer-events-auto flex items-start gap-3 rounded-2xl border border-border/35 bg-background/90 px-3.5 py-2.5 shadow-elevation-4 backdrop-blur-xl"
       >
-        <div className="grid min-w-0 flex-1 grid-cols-3 items-start divide-x divide-border/18">
+        <div
+          className="grid min-w-0 flex-1 items-start divide-x divide-border/18"
+          style={{ gridTemplateColumns: `repeat(${hints.length}, minmax(0, 1fr))` }}
+        >
           {hints.map((hint) => (
             <CameraControlHintItem hint={hint} key={hint.action} />
           ))}
@@ -780,6 +800,7 @@ const ViewerSceneContent = memo(function ViewerSceneContent({
       {!(isLoading || isFirstPersonMode) && <SnapAwareGrid />}
       {!(isLoading || noEditing) && <ToolManager />}
       {isFirstPersonMode && <FirstPersonControls />}
+      {isCaptureMode && <CaptureCameraRig />}
       <CustomCameraControls />
       <ThumbnailGenerator onThumbnailCapture={onThumbnailCapture} />
       {!isFirstPersonMode && <SiteEdgeLabels />}
@@ -988,6 +1009,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
   const floorplanPaneRatio = useEditor((s) => s.floorplanPaneRatio)
   const setFloorplanPaneRatio = useEditor((s) => s.setFloorplanPaneRatio)
   const isPreviewMode = useEditor((s) => s.isPreviewMode)
+  const isCaptureMode = useEditor((s) => s.isCaptureMode)
 
   const [isCameraControlsHintVisible, setIsCameraControlsHintVisible] = useState<boolean | null>(
     null,
@@ -1100,8 +1122,12 @@ const ViewerCanvas = memo(function ViewerCanvas({
             hoverStyles={EDITOR_HOVER_STYLES}
             onSceneReadyChange={onSceneReadyChange}
             renderContext="editor"
+            renderPaused={!show3d && !showLoader}
             sceneReadyKey={sceneReadyKey}
-            selectionManager={isFirstPersonMode ? 'default' : 'custom'}
+            // Walk/drone framing during snapshot capture is camera-only: the
+            // viewer's default selection manager would hover-highlight whatever
+            // the cursor crosses, which orbit capture never does.
+            selectionManager={isFirstPersonMode && !isCaptureMode ? 'default' : 'custom'}
           >
             <ViewerSceneContent
               isFirstPersonMode={isFirstPersonMode}
@@ -1118,6 +1144,60 @@ const ViewerCanvas = memo(function ViewerCanvas({
     </ErrorBoundary>
   )
 })
+
+function PreviewStage({
+  isFirstPersonMode,
+  mode,
+  onModeChange,
+  showLoader,
+  viewerContent,
+}: {
+  isFirstPersonMode: boolean
+  mode: ViewerStageMode
+  onModeChange: (mode: ViewerStageMode) => void
+  showLoader: boolean
+  viewerContent: ReactNode
+}) {
+  const hasFloorplan = useScene((state) =>
+    Object.values(state.nodes).some((node) => node.type === 'level'),
+  )
+
+  const handleModeChange = useCallback(
+    (nextMode: ViewerStageMode) => {
+      if (nextMode !== '3d') useEditor.getState().setFirstPersonMode(false)
+      onModeChange(nextMode)
+    },
+    [onModeChange],
+  )
+
+  const stageMode = isFirstPersonMode || !hasFloorplan ? '3d' : mode
+  const stageModes = hasFloorplan && !isFirstPersonMode ? undefined : (['3d'] as const)
+
+  return (
+    <div className="dark relative h-full w-full overflow-hidden bg-neutral-100 text-foreground">
+      {isFirstPersonMode ? (
+        <FirstPersonOverlay onExit={() => useEditor.getState().setFirstPersonMode(false)} />
+      ) : (
+        <ViewerOverlay
+          hideBottomBar={stageMode !== '3d'}
+          onBack={() => useEditor.getState().setPreviewMode(false)}
+        />
+      )}
+
+      <ViewerStage
+        className="absolute inset-0"
+        mode={stageMode}
+        modes={stageModes}
+        onModeChange={handleModeChange}
+        showCompass={hasFloorplan && !isFirstPersonMode}
+        showSwitcher={hasFloorplan && !isFirstPersonMode}
+        switcherClassName={`${PREVIEW_STAGE_SWITCHER_POSITION} ${showLoader ? 'z-[70]' : ''}`}
+      >
+        {viewerContent}
+      </ViewerStage>
+    </div>
+  )
+}
 
 export default function Editor({
   layoutVersion = 'v1',
@@ -1166,6 +1246,7 @@ export default function Editor({
   const [hasLoadedInitialScene, setHasLoadedInitialScene] = useState(false)
   const [sceneReadyKey, setSceneReadyKey] = useState(0)
   const [isViewerSceneReady, setIsViewerSceneReady] = useState(false)
+  const [previewStageMode, setPreviewStageMode] = useState<ViewerStageMode>('3d')
   const isPreviewMode = useEditor((s) => s.isPreviewMode)
   const isCaptureMode = useEditor((s) => s.isCaptureMode)
 
@@ -1262,6 +1343,10 @@ export default function Editor({
   }, [isVersionPreviewMode])
 
   useEffect(() => {
+    if (!isPreviewMode) setPreviewStageMode('3d')
+  }, [isPreviewMode])
+
+  useEffect(() => {
     document.body.classList.add('dark')
     return () => {
       document.body.classList.remove('dark')
@@ -1286,10 +1371,19 @@ export default function Editor({
   }, [hasLoadedInitialScene, isLoading, isSceneLoading, isViewerSceneReady, sceneReadyKey])
 
   const showLoader = isLoading || isSceneLoading || !hasLoadedInitialScene || !isViewerSceneReady
+  const visibleLoader =
+    showLoader &&
+    !(
+      isPreviewMode &&
+      previewStageMode === '2d' &&
+      !isLoading &&
+      !isSceneLoading &&
+      hasLoadedInitialScene
+    )
 
   useEffect(() => {
-    onLoaderChange?.(showLoader)
-  }, [showLoader, onLoaderChange])
+    onLoaderChange?.(visibleLoader)
+  }, [visibleLoader, onLoaderChange])
 
   const firstPersonPreviousLevelRef = useRef(useViewer.getState().selection.levelId)
   const wasFirstPersonModeRef = useRef(isFirstPersonMode)
@@ -1376,11 +1470,24 @@ export default function Editor({
         tabMap.set(p.id, { id: p.id, label: p.label, icon: p.icon, component: p.component })
       }
     }
+    // Built-in vertical-overview tab: the host may override it by supplying a
+    // tab with the same id.
+    if (!tabMap.has('vertical')) {
+      tabMap.set('vertical', {
+        id: 'vertical',
+        label: 'Vertical',
+        icon: <Ruler className="h-5 w-5" />,
+        component: VerticalOverviewPanel,
+      })
+    }
 
     const renderTabContent = (tabId: string) => {
       // Built-in panels
       if (tabId === 'site') {
         return <SitePanel {...sitePanelProps} />
+      }
+      if (tabId === 'vertical') {
+        return <VerticalOverviewPanel />
       }
       if (tabId === 'settings') {
         return <SettingsPanel {...settingsPanelProps} />
@@ -1393,12 +1500,13 @@ export default function Editor({
     }
 
     const tabBarTabs = [
-      ...(sidebarTabs?.map(({ id, label, mobileDefaultSnap, mobileIcon, icon }) => ({
+      ...(sidebarTabs?.map(({ id, label, mobileDefaultSnap, mobileIcon, icon, noPanel }) => ({
         id,
         label,
         mobileDefaultSnap,
         mobileIcon,
         icon,
+        noPanel,
       })) ?? []),
       // Host panels appear after the explicit tabs in the rail. The icon
       // doubles as the mobile icon; a half-height sheet is a sensible default.
@@ -1409,28 +1517,37 @@ export default function Editor({
         mobileIcon: p.icon,
         icon: p.icon,
       })),
+      // Built-in vertical overview, last of the built-ins.
+      ...(tabMap.has('vertical') && !(sidebarTabs ?? []).some((t) => t.id === 'vertical')
+        ? [
+            {
+              id: 'vertical',
+              label: 'Vertical',
+              mobileDefaultSnap: 0.6,
+              mobileIcon: <Ruler className="h-5 w-5" />,
+              icon: <Ruler className="h-5 w-5" />,
+            },
+          ]
+        : []),
     ]
 
     return (
       <>
         <FloorplanModeCoordinator />
-        {showLoader && (
+        {visibleLoader && (
           <div className="fixed inset-0 z-60">
             <SceneLoader className="bg-background" />
           </div>
         )}
 
         {!isLoading && isPreviewMode ? (
-          <div className="dark flex h-full w-full flex-col bg-neutral-100 text-foreground">
-            {isFirstPersonMode ? (
-              <FirstPersonOverlay onExit={() => useEditor.getState().setFirstPersonMode(false)} />
-            ) : (
-              <ViewerOverlay onBack={() => useEditor.getState().setPreviewMode(false)} />
-            )}
-            <div className="h-full w-full" data-pascal-viewer-3d>
-              {previewViewerContent}
-            </div>
-          </div>
+          <PreviewStage
+            isFirstPersonMode={isFirstPersonMode}
+            mode={previewStageMode}
+            onModeChange={setPreviewStageMode}
+            showLoader={visibleLoader}
+            viewerContent={previewViewerContent}
+          />
         ) : (
           <>
             <EditorLayoutV2
@@ -1438,6 +1555,7 @@ export default function Editor({
               overlays={
                 <>
                   {!(isCaptureMode || stageOverlay) && <FloatingLevelSelector />}
+                  <LevelBatchDialogs />
                   {!(isVersionPreviewMode || isCaptureMode || isStudioMode) && (
                     <div className="pointer-events-auto">
                       <ActionMenu />
@@ -1456,7 +1574,10 @@ export default function Editor({
                       <HelperManager />
                     </div>
                   )}
-                  {isFirstPersonMode && (
+                  {/* Capture mode drives walk / drone from its own overlay, which
+                      owns the framing chrome — the walkthrough HUD would both
+                      clutter the frame and offer a second, conflicting exit. */}
+                  {isFirstPersonMode && !isCaptureMode && (
                     <FirstPersonOverlay
                       onExit={() => useEditor.getState().setFirstPersonMode(false)}
                     />
@@ -1490,23 +1611,20 @@ export default function Editor({
   return (
     <div className="dark flex h-full w-full gap-3 bg-neutral-100 p-3 text-foreground">
       <FloorplanModeCoordinator />
-      {showLoader && (
+      {visibleLoader && (
         <div className="fixed inset-0 z-60">
           <SceneLoader className="bg-background" />
         </div>
       )}
 
       {!isLoading && isPreviewMode ? (
-        <>
-          {isFirstPersonMode ? (
-            <FirstPersonOverlay onExit={() => useEditor.getState().setFirstPersonMode(false)} />
-          ) : (
-            <ViewerOverlay onBack={() => useEditor.getState().setPreviewMode(false)} />
-          )}
-          <div className="h-full w-full" data-pascal-viewer-3d>
-            {previewViewerContent}
-          </div>
-        </>
+        <PreviewStage
+          isFirstPersonMode={isFirstPersonMode}
+          mode={previewStageMode}
+          onModeChange={setPreviewStageMode}
+          showLoader={visibleLoader}
+          viewerContent={previewViewerContent}
+        />
       ) : (
         <>
           {/* Sidebar */}

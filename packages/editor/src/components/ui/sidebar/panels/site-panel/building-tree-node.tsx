@@ -1,6 +1,6 @@
 import { type BuildingNode, DEFAULT_LEVEL_HEIGHT, LevelNode, useScene } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
-import { Building2, Plus } from 'lucide-react'
+import { Building2, Layers, Plus } from 'lucide-react'
 import { memo, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import {
@@ -8,6 +8,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from './../../../../../components/ui/primitives/tooltip'
+import { useLevelBatch } from './../../../../../store/use-level-batch'
 import { focusTreeNode, TreeNode, TreeNodeWrapper } from './tree-node'
 import { TreeNodeActions } from './tree-node-actions'
 
@@ -32,6 +33,7 @@ export const BuildingTreeNode = memo(function BuildingTreeNode({
   const isSelected = useViewer((state) => state.selection.buildingId === nodeId)
   const isHovered = useViewer((state) => state.hoveredId === nodeId)
   const setSelection = useViewer((state) => state.setSelection)
+  const openBatchDialog = useLevelBatch((state) => state.openBatchDialog)
 
   const handleClick = () => {
     setSelection({ buildingId: nodeId })
@@ -50,11 +52,27 @@ export const BuildingTreeNode = memo(function BuildingTreeNode({
     createNode(newLevel, nodeId)
   }
 
+  const handleBatchCreateLevels = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    openBatchDialog(nodeId)
+  }
+
   return (
     <TreeNodeWrapper
       actions={
         <div className="flex items-center gap-0.5">
           <TreeNodeActions nodeId={nodeId} />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                className="flex h-5 w-5 items-center justify-center rounded hover:bg-primary-foreground/20"
+                onClick={handleBatchCreateLevels}
+              >
+                <Layers className="h-3 w-3" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right">Batch create levels</TooltipContent>
+          </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
               <button

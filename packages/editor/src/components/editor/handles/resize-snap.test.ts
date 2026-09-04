@@ -49,4 +49,50 @@ describe('resolveResizeSnapValue', () => {
     ).toBe(0.56)
     expect(magneticSnap).not.toHaveBeenCalled()
   })
+
+  it('applies a structural connection snap independently of the active mode', () => {
+    const connectionSnap = mock(() => 0.6)
+
+    expect(
+      resolveResizeSnapValue({
+        rawValue: 0.59,
+        gridSnapEnabled: false,
+        gridSnapActive: false,
+        gridSnapStep: 0.1,
+        magneticSnapActive: false,
+        connectionSnap,
+      }),
+    ).toBe(0.6)
+    expect(connectionSnap).toHaveBeenCalledWith(0.59)
+  })
+
+  it('bypasses a structural connection snap while force-moving', () => {
+    const connectionSnap = mock(() => 0.6)
+
+    expect(
+      resolveResizeSnapValue({
+        rawValue: 0.59,
+        gridSnapEnabled: false,
+        gridSnapActive: false,
+        gridSnapStep: 0.1,
+        magneticSnapActive: false,
+        connectionSnapActive: false,
+        connectionSnap,
+      }),
+    ).toBe(0.59)
+    expect(connectionSnap).not.toHaveBeenCalled()
+  })
+
+  it('keeps the last valid value when pointer projection is non-finite', () => {
+    expect(
+      resolveResizeSnapValue({
+        rawValue: Number.NaN,
+        fallbackValue: 12.3,
+        gridSnapEnabled: false,
+        gridSnapActive: false,
+        gridSnapStep: 0.5,
+        magneticSnapActive: false,
+      }),
+    ).toBe(12.3)
+  })
 })

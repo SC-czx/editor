@@ -33,7 +33,7 @@ export function SceneMaterialList({ autoEditId }: { autoEditId?: SceneMaterialId
   const removeSceneMaterial = useScene((state) => state.removeSceneMaterial)
   const activePaintTarget = useEditor((state) => state.activePaintTarget)
   const activePaintRef = useEditor((state) => state.activePaintMaterial?.materialPreset)
-  const setActivePaintMaterial = useEditor((state) => state.setActivePaintMaterial)
+  const armMaterialPaint = useEditor((state) => state.armMaterialPaint)
 
   const materialEntries = useMemo(
     () => Object.entries(materials) as [SceneMaterialId, SceneMaterial][],
@@ -76,7 +76,7 @@ export function SceneMaterialList({ autoEditId }: { autoEditId?: SceneMaterialId
           key={id}
           removeSceneMaterial={removeSceneMaterial}
           sceneMaterial={sceneMaterial}
-          setActivePaintMaterial={setActivePaintMaterial}
+          armMaterialPaint={armMaterialPaint}
           updateSceneMaterial={updateSceneMaterial}
           usageCount={usageCounts.get(id) ?? 0}
         />
@@ -95,7 +95,7 @@ function SceneMaterialRow({
   addSceneMaterial,
   updateSceneMaterial,
   removeSceneMaterial,
-  setActivePaintMaterial,
+  armMaterialPaint,
 }: {
   id: SceneMaterialId
   sceneMaterial: SceneMaterial
@@ -106,7 +106,7 @@ function SceneMaterialRow({
   addSceneMaterial: ReturnType<typeof useScene.getState>['addSceneMaterial']
   updateSceneMaterial: ReturnType<typeof useScene.getState>['updateSceneMaterial']
   removeSceneMaterial: ReturnType<typeof useScene.getState>['removeSceneMaterial']
-  setActivePaintMaterial: ReturnType<typeof useEditor.getState>['setActivePaintMaterial']
+  armMaterialPaint: ReturnType<typeof useEditor.getState>['armMaterialPaint']
 }) {
   // A freshly-created material (via "+ Custom") mounts with its editor open.
   const [isEditingMaterial, setIsEditingMaterial] = useState(autoEdit)
@@ -141,6 +141,7 @@ function SceneMaterialRow({
       className={`rounded-md border border-border/60 bg-background/40 p-2 ${
         isActive ? 'ring-1 ring-primary ring-inset' : ''
       }`}
+      data-testid={`scene-material-row-${id}`}
     >
       <div className="flex items-center gap-2">
         <span
@@ -174,7 +175,7 @@ function SceneMaterialRow({
               <Button
                 aria-label="Paint with"
                 onClick={() =>
-                  setActivePaintMaterial({
+                  armMaterialPaint({
                     materialPreset: toSceneMaterialRef(id),
                     sourceTarget: activePaintTarget,
                   })

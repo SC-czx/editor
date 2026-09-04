@@ -46,6 +46,7 @@ import {
   resolveDirectManipulationNode,
   resolveDirectRotationDragDelta,
   resolveDirectRotationPatch,
+  shouldStartDirectMoveDrag,
   snapDirectRotationDelta,
 } from '../../../lib/direct-manipulation'
 import { createEditorApi } from '../../../lib/editor-api'
@@ -67,6 +68,10 @@ import {
   resolveFloorplanAnnotationVisibility,
   resolveFloorplanWallDimensionReference,
 } from '../../../lib/floorplan/floorplan-mode'
+import {
+  buildFloorplanContext,
+  floorplanLayerRank,
+} from '../../../lib/floorplan/floorplan-readonly'
 import { clientToPlan } from '../../../lib/floorplan/plan-coords'
 import {
   type ActiveInteractionScope,
@@ -640,16 +645,24 @@ export const FloorplanRegistryLayer = memo(function FloorplanRegistryLayer() {
 
   const startDirectMoveDrag = useCallback(
     (id: AnyNodeId, event: ReactPointerEvent<SVGGElement>): boolean => {
-      if (event.button !== 0 || !(event.metaKey || event.ctrlKey)) return false
+      if (event.button !== 0) return false
 
       const node = useScene.getState().nodes[id]
       if (!node || !isRegistryMovable(node.type)) return false
-      // Sole selection only: per-node direct manipulation stands down for a
-      // multi-selection (the group session owns plain drags there, and Cmd is
-      // the selection-toggle key — a wobbly Cmd+click must not yank one
-      // member out of the group).
       const currentSelectedIds = useViewer.getState().selection.selectedIds
-      if (currentSelectedIds.length !== 1 || currentSelectedIds[0] !== id) return false
+      const allowPlainDrag = nodeRegistry.get(node.type)?.capabilities?.movable?.directDrag === true
+      const commandModifier = event.metaKey || event.ctrlKey
+      if (
+        !shouldStartDirectMoveDrag({
+          allowPlainDrag,
+          commandModifier,
+          handleOwnsPointer: false,
+          nodeId: id,
+          selectedIds: currentSelectedIds,
+        })
+      ) {
+        return false
+      }
 
       event.preventDefault()
       event.stopPropagation()
@@ -701,9 +714,8 @@ export const FloorplanRegistryLayer = memo(function FloorplanRegistryLayer() {
         if (endEvent.pointerId !== pointerId) return
         cleanup()
         if (!engaged) {
-          // Cmd/Ctrl+click without drag: toggle member (options object, not bare boolean).
           applyEntrySelection(id, {
-            shouldToggle: true,
+            shouldToggle: commandModifier,
             isolateMember: false,
           })
         }
@@ -1044,6 +1056,7 @@ export const FloorplanRegistryLayer = memo(function FloorplanRegistryLayer() {
         nodes: sceneNodes,
         initialPlanPoint,
         gridSnapStep: useEditor.getState().gridSnapStep,
+        sceneApi: createSceneApi(useScene),
       })
       if (!(session.commit && session.canCommit())) return
       session.commit()
@@ -1087,6 +1100,7 @@ export const FloorplanRegistryLayer = memo(function FloorplanRegistryLayer() {
         nodes: sceneNodes,
         initialPlanPoint,
         gridSnapStep: useEditor.getState().gridSnapStep,
+        sceneApi: createSceneApi(useScene),
       })
 
       const snapshots: NodeSnapshot[] = []
@@ -1939,12 +1953,12 @@ const FloorplanRegistryEntry = memo(function FloorplanRegistryEntry({
       // the body-drag gesture — the whole selection slides, not one member.
       if (onGroupMovePointerDown(nodeId, event)) return
       sfxEmitter.emit('sfx:item-pick')
-      setMovingNode(currentNode as never)
+      createEditorApi().engageMove(currentNode)
       // Claim 2D ownership of this move at the source. `setMovingNode`
       // resets the origin to null, so this must follow it.
       setMovingNodeOrigin('2d')
     },
-    [nodeId, onGroupMovePointerDown, setMovingNode, setMovingNodeOrigin],
+    [nodeId, onGroupMovePointerDown, setMovingNodeOrigin],
   )
 
   const cacheEntry = buildFloorplanEntryGeometry({
@@ -3158,73 +3172,7 @@ function isFloorplanHierarchyVisible(
   return true
 }
 
-export function buildContext(
-  node: AnyNode,
-  nodes: Record<string, AnyNode>,
-  viewState: {
-    automaticDimensions?: boolean
-    selected: boolean
-    unit: 'metric' | 'imperial'
-    metricNotation?: 'meters' | 'millimeters'
-    purpose?: 'edit' | 'document'
-    wallDimensionReference?: FloorplanWallDimensionReference
-    highlighted: boolean
-    hovered: boolean
-    moving: boolean
-    palette: FloorplanPalette | undefined
-  },
-  levelData?: unknown,
-): GeometryContext {
-  const resolve = <N = AnyNode>(id: AnyNodeId): N | undefined => nodes[id] as N | undefined
-
-  const childIds = (node as unknown as { children?: AnyNodeId[] }).children
-  const children: AnyNode[] = Array.isArray(childIds)
-    ? childIds.map((cid) => nodes[cid]).filter((n): n is AnyNode => n !== undefined)
-    : []
-
-  const parentId = node.parentId as AnyNodeId | null
-  const parent: AnyNode | null = parentId ? (nodes[parentId] ?? null) : null
-
-  let siblings: AnyNode[] = []
-  if (parent) {
-    const parentChildIds = (parent as unknown as { children?: AnyNodeId[] }).children
-    if (Array.isArray(parentChildIds)) {
-      for (const sid of parentChildIds) {
-        if (sid === node.id) continue
-        const s = nodes[sid]
-        if (s && s.type === node.type) siblings.push(s)
-      }
-    } else {
-      siblings = Object.values(nodes).filter(
-        (n) => n !== node && n.type === node.type && n.parentId === parentId,
-      )
-    }
-  }
-
-  return {
-    resolve,
-    children,
-    siblings,
-    parent,
-    levelData,
-    extensions: createFloorplanContextExtensions({
-      automaticDimensions: viewState.automaticDimensions,
-      metricNotation: viewState.metricNotation ?? 'meters',
-      purpose: viewState.purpose ?? 'edit',
-      wallDimensionReference: viewState.wallDimensionReference,
-    }),
-    viewState: viewState.palette
-      ? {
-          selected: viewState.selected,
-          unit: viewState.unit,
-          highlighted: viewState.highlighted,
-          hovered: viewState.hovered,
-          moving: viewState.moving,
-          palette: viewState.palette,
-        }
-      : undefined,
-  }
-}
+export const buildContext = buildFloorplanContext
 
 export function collectFloorplanLinkedLevelNodes(
   nodes: Record<string, AnyNode>,
@@ -3526,17 +3474,7 @@ function depsValueEqual(a: unknown, b: unknown): boolean {
  * Sort is stable in modern JS engines, so siblings within the same
  * bucket keep their DFS order (= scene tree order).
  */
-export function floorplanLayerRank(type: string): number {
-  switch (type) {
-    case 'zone':
-      return 0
-    case 'slab':
-    case 'ceiling':
-      return 1
-    default:
-      return 2
-  }
-}
+export { floorplanLayerRank }
 
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true

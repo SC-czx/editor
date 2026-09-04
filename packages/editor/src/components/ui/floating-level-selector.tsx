@@ -23,17 +23,30 @@ import {
   type AnyNodeId,
   type BuildingNode,
   DEFAULT_LEVEL_HEIGHT,
+  emitter,
   getStoredLevelHeight,
   LevelNode,
   useScene,
 } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
-import { ClipboardPaste, Copy, GripVertical, MoreVertical, Plus, Trash2 } from 'lucide-react'
+import {
+  ClipboardPaste,
+  Copy,
+  CopyPlus,
+  Crosshair,
+  GripVertical,
+  Layers,
+  MoreVertical,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from 'lucide-react'
 import {
   type ButtonHTMLAttributes,
   type CSSProperties,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react'
@@ -43,10 +56,22 @@ import {
   buildLevelDuplicateCreateOps,
   type LevelDuplicatePreset,
 } from '../../lib/level-duplication'
-import { getDefaultLevelName, getLevelDisplayName } from '@pascal-app/core'
+import {
+  getDefaultLevelName,
+  getLevelDisplayName,
+  MAX_STOREY_HEIGHT,
+  MIN_STOREY_HEIGHT,
+} from '@pascal-app/core'
+import {
+  runBatchLevelHeight,
+  runLevelHeight,
+  runSetTypicalMaster,
+  runSyncTypicalInstances,
+} from '../../lib/level-batch-actions'
 import { deleteLevelWithFallbackSelection } from '../../lib/level-selection'
 import { useLinearDisplay } from '../../lib/use-linear-display'
 import { cn } from '../../lib/utils'
+import { pruneSelectedLevels, useLevelBatch } from '../../store/use-level-batch'
 import { ActionButton } from './controls/action-button'
 import { SliderControl } from './controls/slider-control'
 import { LevelDuplicateDialog } from './level-duplicate-dialog'
@@ -59,6 +84,91 @@ import {
   DialogTitle,
 } from './primitives/dialog'
 import { Popover, PopoverContent, PopoverTrigger } from './primitives/popover'
+
+// ── Typical-floor metadata ──────────────────────────────────────────────────
+
+type TypicalMeta = {
+  isMaster: boolean
+  masterId: string | null
+  masterOrdinal: number | null
+  instanceCount: number
+}
+
+const EMPTY_TYPICAL_META: TypicalMeta = {
+  isMaster: false,
+  masterId: null,
+  masterOrdinal: null,
+  instanceCount: 0,
+}
+
+/**
+ * Compact encoding so the `useShallow` selector compares primitives instead of
+ * freshly-built objects — otherwise this would re-render on every scene edit.
+ * Format: `master:<count>` | `instance:<masterId>:<masterOrdinal>` | ''.
+ */
+function decodeTypicalMeta(encoded: string | undefined): TypicalMeta {
+  if (!encoded) return EMPTY_TYPICAL_META
+  if (encoded.startsWith('master:')) {
+    return {
+      ...EMPTY_TYPICAL_META,
+      isMaster: true,
+      instanceCount: Number.parseInt(encoded.slice('master:'.length), 10) || 0,
+    }
+  }
+  if (encoded.startsWith('instance:')) {
+    const [, masterId, ordinal] = encoded.split(':')
+    const parsed = Number.parseInt(ordinal ?? '', 10)
+    return {
+      ...EMPTY_TYPICAL_META,
+      masterId: masterId || null,
+      masterOrdinal: Number.isNaN(parsed) ? null : parsed,
+    }
+  }
+  return EMPTY_TYPICAL_META
+}
+
+// ── Level groups ────────────────────────────────────────────────────────────
+
+type LevelGroup = { key: string; label: string; levels: LevelNode[] }
+
+/**
+ * Splits the building's levels into the four vertical bands, preserving the
+ * top-first display order. Bands are contiguous by ordinal, so the existing
+ * drag-to-reorder logic (which reads the flat visual order) keeps working
+ * unchanged.
+ *
+ * With a single level there is no top floor to break out — that level *is* the
+ * ground floor.
+ */
+export function buildLevelGroups(levelsDescending: LevelNode[]): LevelGroup[] {
+  if (levelsDescending.length === 0) return []
+
+  const topId = levelsDescending.length > 1 ? levelsDescending[0]?.id : undefined
+  const buckets = new Map<string, LevelNode[]>()
+  const push = (key: string, level: LevelNode) => {
+    const bucket = buckets.get(key)
+    if (bucket) bucket.push(level)
+    else buckets.set(key, [level])
+  }
+
+  for (const level of levelsDescending) {
+    if (level.id === topId) push('top', level)
+    else if (level.level < 0) push('basement', level)
+    else if (level.level === 0) push('ground', level)
+    else push('standard', level)
+  }
+
+  const order: Array<{ key: string; label: string }> = [
+    { key: 'top', label: 'Top floor' },
+    { key: 'standard', label: 'Standard floors' },
+    { key: 'ground', label: 'Ground floor' },
+    { key: 'basement', label: 'Basement' },
+  ]
+
+  return order
+    .filter((entry) => buckets.has(entry.key))
+    .map((entry) => ({ ...entry, levels: buckets.get(entry.key) ?? [] }))
+}
 
 // ── Inline rename input for a level row ─────────────────────────────────────
 
@@ -119,37 +229,83 @@ function LevelInlineRename({
   )
 }
 
+// ── Typical-floor badges ────────────────────────────────────────────────────
+
+function TypicalMasterBadge({ instanceCount }: { instanceCount: number }) {
+  return (
+    <span
+      className="mr-0.5 flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded bg-primary/20 px-1 py-0.5 font-medium text-[9px] text-primary"
+      title={`Typical floor master · ${instanceCount} instance${instanceCount === 1 ? '' : 's'}`}
+    >
+      <Layers className="h-2.5 w-2.5" />M
+      {instanceCount > 0 && <span className="tabular-nums">{instanceCount}</span>}
+    </span>
+  )
+}
+
+function TypicalInstanceBadge({
+  masterOrdinal,
+  onGoToMaster,
+}: {
+  masterOrdinal: number | null
+  onGoToMaster: () => void
+}) {
+  const label = masterOrdinal === null ? '↗' : `↗${masterOrdinal}`
+  return (
+    <button
+      className="mr-0.5 flex shrink-0 items-center whitespace-nowrap rounded bg-sky-500/20 px-1 py-0.5 font-medium text-[9px] text-sky-300 transition-colors hover:bg-sky-500/35 hover:text-sky-200"
+      onClick={(e) => {
+        e.stopPropagation()
+        onGoToMaster()
+      }}
+      title="Go to the typical floor master"
+      type="button"
+    >
+      {label}
+    </button>
+  )
+}
+
 // ── Level row with three-dot menu ───────────────────────────────────────────
 
 function LevelRow({
   level,
   isSelected,
   isDragging,
-  dragHandleProps,
-  dragHandleRef,
+  isMultiSelected,
+  typical,
   onSelect,
   onDuplicate,
   onPaste,
   onRequestDelete,
+  onToggleMultiSelect,
+  dragHandleProps,
+  dragHandleRef,
 }: {
   level: LevelNode
   isSelected: boolean
   isDragging?: boolean
-  dragHandleProps?: ButtonHTMLAttributes<HTMLButtonElement>
-  dragHandleRef?: (element: HTMLButtonElement | null) => void
-  onSelect: () => void
+  isMultiSelected: boolean
+  typical: TypicalMeta
+  onSelect: (additive: boolean) => void
   onDuplicate: (preset?: LevelDuplicatePreset) => void
   onPaste?: () => void
   onRequestDelete: () => void
+  onToggleMultiSelect: () => void
+  dragHandleProps?: ButtonHTMLAttributes<HTMLButtonElement>
+  dragHandleRef?: (element: HTMLButtonElement | null) => void
 }) {
   const [duplicateDialogOpen, setDuplicateDialogOpen] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
-  const updateNode = useScene((s) => s.updateNode)
+  const setSelection = useViewer((s) => s.setSelection)
   const { isImperial, toDisplay, displayUnit } = useLinearDisplay('m', 2)
 
   const storeyHeight = getStoredLevelHeight(level)
   // toFixed(2) + strip one trailing zero: "2.50" → "2.5", "2.75" stays.
   const storeyHeightLabel = `${toDisplay(storeyHeight).toFixed(2).replace(/0$/, '')} ${displayUnit}`
+  // Same rule as the site panel and command palette: the ordinal-0 ground
+  // floor is the vertical model's zero anchor and must never be deletable.
+  const canDeleteLevel = level.level !== 0
 
   // Clean preset values per display system; imperial stores exact meters
   // for whole-foot storey heights.
@@ -165,6 +321,12 @@ function LevelRow({
         { label: '3.5 m', height: 3.5 },
       ]
 
+  const goToMaster = () => {
+    if (!typical.masterId) return
+    setSelection({ levelId: typical.masterId as LevelNode['id'] })
+    emitter.emit('camera-controls:focus', { nodeId: typical.masterId as AnyNodeId })
+  }
+
   return (
     <div className="group/level">
       {isEditing ? (
@@ -178,6 +340,7 @@ function LevelRow({
           className={cn(
             'flex items-center rounded-lg transition-colors',
             isDragging && 'bg-white/10 text-foreground shadow-lg',
+            isMultiSelected && 'ring-1 ring-primary/60',
             isSelected
               ? 'bg-white/10 text-foreground'
               : 'text-muted-foreground/70 hover:bg-white/5 hover:text-muted-foreground',
@@ -203,15 +366,19 @@ function LevelRow({
 
           <button
             className="flex min-w-0 flex-1 items-center justify-start py-1.5 pr-2 pl-1 font-medium text-xs"
-            onClick={onSelect}
+            onClick={(e) => onSelect(e.metaKey || e.ctrlKey)}
             onDoubleClick={(e) => {
               e.stopPropagation()
               setIsEditing(true)
             }}
-            title={getLevelDisplayName(level)}
+            title={`${getLevelDisplayName(level)} — ⌘/Ctrl-click to add to the height batch`}
             type="button"
           >
             <span className="truncate">{getLevelDisplayName(level)}</span>
+            {typical.isMaster && <TypicalMasterBadge instanceCount={typical.instanceCount} />}
+            {typical.masterId && (
+              <TypicalInstanceBadge masterOrdinal={typical.masterOrdinal} onGoToMaster={goToMaster} />
+            )}
           </button>
 
           {/* Storey height badge — opens the height popover */}
@@ -235,9 +402,9 @@ function LevelRow({
             >
               <SliderControl
                 label="Level height"
-                max={6}
+                max={20}
                 min={1}
-                onChange={(v) => updateNode(level.id, { height: v })}
+                onChange={(v) => runLevelHeight(level.id as AnyNodeId, v)}
                 precision={3}
                 step={0.1}
                 unit="m"
@@ -249,7 +416,7 @@ function LevelRow({
                     className="h-7 px-2"
                     key={preset.label}
                     label={preset.label}
-                    onClick={() => updateNode(level.id, { height: preset.height })}
+                    onClick={() => runLevelHeight(level.id as AnyNodeId, preset.height)}
                   />
                 ))}
               </div>
@@ -267,53 +434,99 @@ function LevelRow({
                 <MoreVertical className="h-3 w-3" />
               </button>
             </PopoverTrigger>
-            <PopoverContent align="start" className="w-44 p-1" side="right" sideOffset={8}>
-              <button
-                className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-muted-foreground text-xs transition-colors hover:bg-white/10 hover:text-foreground"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onDuplicate()
-                }}
-                type="button"
+            <PopoverContent align="start" className="w-52 p-1" side="right" sideOffset={8}>
+              <MenuItem
+                icon={<Copy className="h-3 w-3" />}
+                onClick={() => onDuplicate()}
+                title="Duplicate level"
               >
-                <Copy className="h-3 w-3" />
                 Duplicate level
-              </button>
-              <button
-                className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-muted-foreground text-xs transition-colors hover:bg-white/10 hover:text-foreground"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setDuplicateDialogOpen(true)
-                }}
-                type="button"
+              </MenuItem>
+              <MenuItem
+                icon={<Copy className="h-3 w-3" />}
+                onClick={() => setDuplicateDialogOpen(true)}
+                title="Duplicate level with options"
               >
-                <Copy className="h-3 w-3" />
                 Duplicate with options...
-              </button>
+              </MenuItem>
               {onPaste && (
-                <button
-                  className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-muted-foreground text-xs transition-colors hover:bg-white/10 hover:text-foreground"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    onPaste()
-                  }}
-                  type="button"
+                <MenuItem
+                  icon={<ClipboardPaste className="h-3 w-3" />}
+                  onClick={onPaste}
+                  title="Paste copied selection"
                 >
-                  <ClipboardPaste className="h-3 w-3" />
                   Paste copied selection
-                </button>
+                </MenuItem>
               )}
-              <button
-                className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-muted-foreground text-xs transition-colors hover:bg-white/10 hover:text-red-400"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onRequestDelete()
-                }}
-                type="button"
+
+              <div className="my-1 h-px bg-border/60" />
+
+              {typical.isMaster ? (
+                <MenuItem
+                  icon={<Layers className="h-3 w-3" />}
+                  onClick={() => runSetTypicalMaster(level.id as AnyNodeId, false)}
+                  title="Unmark this typical floor master"
+                >
+                  Unmark typical master
+                </MenuItem>
+              ) : (
+                <MenuItem
+                  icon={<Layers className="h-3 w-3" />}
+                  onClick={() => runSetTypicalMaster(level.id as AnyNodeId, true)}
+                  title="Mark this level as a typical floor master"
+                >
+                  Mark as typical master
+                </MenuItem>
+              )}
+              {typical.isMaster && (
+                <>
+                  <MenuItem
+                    icon={<CopyPlus className="h-3 w-3" />}
+                    onClick={() =>
+                      useLevelBatch.getState().openTypicalDerive(level.id as AnyNodeId)
+                    }
+                    title="Derive typical floor instances from this master"
+                  >
+                    Derive typical floors...
+                  </MenuItem>
+                  <MenuItem
+                    icon={<RefreshCw className="h-3 w-3" />}
+                    onClick={() => runSyncTypicalInstances(level.id as AnyNodeId)}
+                    title="Push this master's structure onto every instance"
+                  >
+                    Sync {typical.instanceCount} instance
+                    {typical.instanceCount === 1 ? '' : 's'}
+                  </MenuItem>
+                </>
+              )}
+              {typical.masterId && (
+                <MenuItem
+                  icon={<Crosshair className="h-3 w-3" />}
+                  onClick={goToMaster}
+                  title="Select and focus the typical floor master"
+                >
+                  Go to master floor
+                </MenuItem>
+              )}
+
+              <div className="my-1 h-px bg-border/60" />
+
+              <MenuItem
+                icon={<Plus className="h-3 w-3" />}
+                onClick={onToggleMultiSelect}
+                title="Add this level to the batch height selection"
               >
-                <Trash2 className="h-3 w-3" />
+                {isMultiSelected ? 'Remove from height batch' : 'Add to height batch'}
+              </MenuItem>
+              <MenuItem
+                className="enabled:hover:bg-white/10 enabled:hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!canDeleteLevel}
+                icon={<Trash2 className="h-3 w-3" />}
+                onClick={onRequestDelete}
+                title={canDeleteLevel ? 'Delete level' : 'The ground level cannot be deleted'}
+              >
                 Delete level
-              </button>
+              </MenuItem>
             </PopoverContent>
           </Popover>
         </div>
@@ -331,20 +544,61 @@ function LevelRow({
   )
 }
 
+function MenuItem({
+  children,
+  icon,
+  className,
+  disabled,
+  onClick,
+  title,
+}: {
+  children: React.ReactNode
+  icon: React.ReactNode
+  className?: string
+  disabled?: boolean
+  onClick: () => void
+  title?: string
+}) {
+  return (
+    <button
+      className={cn(
+        'flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-muted-foreground text-xs transition-colors hover:bg-white/10 hover:text-foreground',
+        className,
+      )}
+      disabled={disabled}
+      onClick={(e) => {
+        e.stopPropagation()
+        onClick()
+      }}
+      title={title}
+      type="button"
+    >
+      {icon}
+      {children}
+    </button>
+  )
+}
+
 function SortableLevelRow({
   level,
   isSelected,
+  isMultiSelected,
+  typical,
   onSelect,
   onDuplicate,
   onPaste,
   onRequestDelete,
+  onToggleMultiSelect,
 }: {
   level: LevelNode
   isSelected: boolean
-  onSelect: () => void
+  isMultiSelected: boolean
+  typical: TypicalMeta
+  onSelect: (additive: boolean) => void
   onDuplicate: (preset?: LevelDuplicatePreset) => void
   onPaste?: () => void
   onRequestDelete: () => void
+  onToggleMultiSelect: () => void
 }) {
   const {
     attributes,
@@ -370,13 +624,78 @@ function SortableLevelRow({
         dragHandleProps={{ ...attributes, ...listeners }}
         dragHandleRef={setActivatorNodeRef}
         isDragging={isDragging}
+        isMultiSelected={isMultiSelected}
         isSelected={isSelected}
         level={level}
         onDuplicate={onDuplicate}
         onPaste={onPaste}
         onRequestDelete={onRequestDelete}
         onSelect={onSelect}
+        onToggleMultiSelect={onToggleMultiSelect}
+        typical={typical}
       />
+    </div>
+  )
+}
+
+// ── Batch height bar ────────────────────────────────────────────────────────
+
+function BatchHeightBar({ levelIds }: { levelIds: AnyNodeId[] }) {
+  const clearSelectedLevels = useLevelBatch((state) => state.clearSelectedLevels)
+  const { isImperial, toDisplay, toStored, displayUnit } = useLinearDisplay('m', 2)
+  const [raw, setRaw] = useState('2.8')
+  const [error, setError] = useState<string | null>(null)
+
+  const stored = toStored(Number.parseFloat(raw) || 0)
+  const outOfRange = stored < MIN_STOREY_HEIGHT || stored > MAX_STOREY_HEIGHT
+
+  return (
+    <div className="mt-1 flex flex-col gap-1 rounded-xl border border-primary/30 bg-background/90 p-1.5 shadow-2xl backdrop-blur-md">
+      <div className="px-0.5 text-muted-foreground text-[10px]">
+        {levelIds.length} level{levelIds.length === 1 ? '' : 's'} selected
+      </div>
+      <div className="flex items-center gap-1">
+        <input
+          className={cn(
+            'min-w-0 flex-1 rounded-lg border bg-accent/30 px-1.5 py-1 text-foreground text-xs outline-none focus:border-primary',
+            outOfRange ? 'border-destructive' : 'border-border/60',
+          )}
+          onChange={(e) => {
+            setRaw(e.target.value)
+            setError(null)
+          }}
+          step={isImperial ? 0.25 : 0.1}
+          type="number"
+          value={raw}
+        />
+        <span className="shrink-0 text-muted-foreground text-[10px]">{displayUnit}</span>
+        <button
+          className={cn(
+            'shrink-0 rounded-lg bg-primary px-2 py-1 text-primary-foreground text-[11px] transition-opacity hover:opacity-90',
+            outOfRange && 'cursor-not-allowed opacity-50',
+          )}
+          disabled={outOfRange}
+          onClick={() => {
+            const result = runBatchLevelHeight(levelIds, stored, { enforceHeightRange: true })
+            setError(result.ok ? null : (result.errors[0] ?? 'Could not apply the height.'))
+          }}
+          type="button"
+        >
+          Apply
+        </button>
+        <button
+          className="shrink-0 rounded-lg px-1.5 py-1 text-muted-foreground text-[11px] transition-colors hover:bg-white/5 hover:text-foreground"
+          onClick={clearSelectedLevels}
+          title="Clear selection"
+          type="button"
+        >
+          Clear
+        </button>
+      </div>
+      {error && <div className="px-0.5 text-destructive text-[10px]">{error}</div>}
+      <div className="px-0.5 text-muted-foreground/70 text-[10px]">
+        Levels above shift automatically; walls, ceilings and stairs follow the plane.
+      </div>
     </div>
   )
 }
@@ -390,6 +709,9 @@ export function FloatingLevelSelector() {
   const createNode = useScene((s) => s.createNode)
   const createNodes = useScene((s) => s.createNodes)
   const updateNodes = useScene((s) => s.updateNodes)
+  const openBatchDialog = useLevelBatch((state) => state.openBatchDialog)
+  const selectedLevelIds = useLevelBatch((state) => state.selectedLevelIds)
+  const toggleLevelSelected = useLevelBatch((state) => state.toggleLevelSelected)
 
   const [deletingLevel, setDeletingLevel] = useState<LevelNode | null>(null)
   const [draggingLevelId, setDraggingLevelId] = useState<string | null>(null)
@@ -419,6 +741,46 @@ export function FloatingLevelSelector() {
         .map((id) => state.nodes[id])
         .filter((node): node is LevelNode => node?.type === 'level')
         .sort((a, b) => a.level - b.level)
+    }),
+  )
+
+  // A ticked level that was deleted (or undone away) must not survive into a
+  // later batch height edit.
+  useEffect(() => {
+    pruneSelectedLevels(levels)
+  }, [levels])
+
+  // Typical-floor links, encoded as strings so `useShallow` compares
+  // primitives instead of a freshly-built object per render.
+  const typicalByLevelId = useScene(
+    useShallow((state) => {
+      const counts = new Map<string, number>()
+      const encoded: Record<string, string> = {}
+      const levelNodes: LevelNode[] = []
+      for (const node of Object.values(state.nodes)) {
+        if (node?.type !== 'level') continue
+        levelNodes.push(node)
+        const masterId =
+          typeof node.typicalMasterId === 'string' && node.typicalMasterId.length > 0
+            ? node.typicalMasterId
+            : null
+        if (masterId) counts.set(masterId, (counts.get(masterId) ?? 0) + 1)
+      }
+      for (const node of levelNodes) {
+        const id = node.id as string
+        if (node.typicalMaster === true) {
+          encoded[id] = `master:${counts.get(id) ?? 0}`
+          continue
+        }
+        const masterId =
+          typeof node.typicalMasterId === 'string' && node.typicalMasterId.length > 0
+            ? node.typicalMasterId
+            : null
+        const master = masterId ? state.nodes[masterId as AnyNodeId] : undefined
+        encoded[id] =
+          masterId && master?.type === 'level' ? `instance:${masterId}:${master.level}` : ''
+      }
+      return encoded
     }),
   )
 
@@ -556,10 +918,11 @@ export function FloatingLevelSelector() {
     setDraggingLevelId(null)
   }, [])
 
-  if (levels.length === 0) return null
-
-  const reversedLevels = [...levels].reverse()
+  const reversedLevels = useMemo(() => [...levels].reverse(), [levels])
+  const groups = useMemo(() => buildLevelGroups(reversedLevels), [reversedLevels])
   const sortableLevelIds = reversedLevels.map((level) => level.id)
+
+  if (levels.length === 0) return null
 
   const addButtonClass =
     'absolute left-1/2 z-10 flex h-4 w-4 -translate-x-1/2 items-center justify-center rounded-full border border-border/80 bg-neutral-800 text-muted-foreground/60 shadow-md transition-colors hover:bg-neutral-700 hover:text-foreground'
@@ -572,6 +935,9 @@ export function FloatingLevelSelector() {
           {!draggingLevelId && (
             <button
               className={cn(addButtonClass, 'top-0 -translate-y-1/2')}
+              // A stable hook for host-app onboarding to point at. Static, and
+              // read only from outside: nothing here depends on it.
+              data-guide-target="level-add"
               onClick={handleAddAbove}
               title="Add level above"
               type="button"
@@ -602,44 +968,86 @@ export function FloatingLevelSelector() {
           >
             <SortableContext items={sortableLevelIds} strategy={verticalListSortingStrategy}>
               <div className="flex flex-col gap-0.5 rounded-xl border border-border bg-background/90 p-1 shadow-2xl backdrop-blur-md">
-                {reversedLevels.map((level, i) => {
-                  const isSelected = level.id === levelId
-                  const sortedIndex = levels.indexOf(level)
-                  const showGapBelow = i < reversedLevels.length - 1
-
-                  return (
-                    <div className="relative" key={level.id}>
-                      <SortableLevelRow
-                        isSelected={isSelected}
-                        level={level}
-                        onDuplicate={(preset) => handleDuplicateLevel(level, preset)}
-                        onPaste={() => handlePasteToLevel(level)}
-                        onRequestDelete={() => setDeletingLevel(level)}
-                        onSelect={() =>
-                          setSelection(
-                            resolvedBuildingId
-                              ? { buildingId: resolvedBuildingId, levelId: level.id }
-                              : { levelId: level.id },
-                          )
-                        }
-                      />
-
-                      {showGapBelow && !draggingLevelId && (
-                        <button
-                          className={cn(addButtonClass, 'bottom-0 translate-y-1/2')}
-                          onClick={() => handleInsertBetween(sortedIndex - 1)}
-                          title="Insert level here"
-                          type="button"
-                        >
-                          <Plus className="h-2.5 w-2.5" />
-                        </button>
-                      )}
+                {groups.map((group) => (
+                  <div className="flex flex-col gap-0.5" key={group.key}>
+                    <div className="flex items-center gap-1 px-1.5 pt-0.5 text-muted-foreground/50 text-[9px] uppercase tracking-wide">
+                      <span className="truncate">{group.label}</span>
+                      <span className="h-px flex-1 bg-border/60" />
                     </div>
-                  )
-                })}
+                    {group.levels.map((level) => {
+                      const isSelected = level.id === levelId
+                      const sortedIndex = levels.indexOf(level)
+                      const showGapBelow = level.id !== reversedLevels.at(-1)?.id
+
+                      return (
+                        <div
+                          className="relative"
+                          // A stable hook for host-app onboarding to point at, on
+                          // the ground floor only — the one level a guide can name
+                          // without knowing the building. Static, and read only
+                          // from outside: nothing here depends on it.
+                          data-guide-target={level.level === 0 ? 'level-ground' : undefined}
+                          key={level.id}
+                        >
+                          <SortableLevelRow
+                            isMultiSelected={selectedLevelIds.includes(level.id as AnyNodeId)}
+                            isSelected={isSelected}
+                            level={level}
+                            onDuplicate={(preset) => handleDuplicateLevel(level, preset)}
+                            onPaste={() => handlePasteToLevel(level)}
+                            onRequestDelete={() => setDeletingLevel(level)}
+                            onSelect={(additive) => {
+                              if (additive) {
+                                toggleLevelSelected(level.id as AnyNodeId)
+                                return
+                              }
+                              setSelection(
+                                resolvedBuildingId
+                                  ? { buildingId: resolvedBuildingId, levelId: level.id }
+                                  : { levelId: level.id },
+                              )
+                            }}
+                            onToggleMultiSelect={() => toggleLevelSelected(level.id as AnyNodeId)}
+                            typical={decodeTypicalMeta(typicalByLevelId[level.id])}
+                          />
+
+                          {showGapBelow && !draggingLevelId && (
+                            <button
+                              className={cn(addButtonClass, 'bottom-0 translate-y-1/2')}
+                              onClick={() => handleInsertBetween(sortedIndex - 1)}
+                              title="Insert level here"
+                              type="button"
+                            >
+                              <Plus className="h-2.5 w-2.5" />
+                            </button>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                ))}
+
+                {/* Batch entry points */}
+                {!draggingLevelId && (
+                  <div className="mt-0.5 flex gap-1 border-border/60 border-t pt-1">
+                    <button
+                      className="flex flex-1 items-center justify-center gap-1 rounded-lg px-1.5 py-1 text-muted-foreground text-[10px] transition-colors hover:bg-white/5 hover:text-foreground"
+                      onClick={() => resolvedBuildingId && openBatchDialog(resolvedBuildingId)}
+                      title="Create many levels at once"
+                      type="button"
+                    >
+                      <Layers className="h-3 w-3" />
+                      Batch create
+                    </button>
+                  </div>
+                )}
               </div>
             </SortableContext>
           </DndContext>
+
+          {selectedLevelIds.length > 0 && !draggingLevelId && (
+            <BatchHeightBar levelIds={selectedLevelIds} />
+          )}
         </div>
       </div>
 
@@ -652,6 +1060,13 @@ export function FloatingLevelSelector() {
               Are you sure you want to delete{' '}
               <strong>{deletingLevel ? getLevelDisplayName(deletingLevel) : ''}</strong>? All
               walls, floors, and objects on this level will be permanently removed.
+              {deletingLevel?.typicalMaster === true && (
+                <>
+                  {' '}
+                  It is a typical-floor master — its instances become ordinary levels and keep
+                  their content.
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

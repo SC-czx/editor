@@ -279,9 +279,11 @@ export function SlabPanel() {
       width={320}
     >
       <PanelSection title="Elevation">
+        {/* Range mirrors the 20 m storey cap; `clampSlabElevation` in the
+            write path stays the real bound against the level. */}
         <SliderControl
           label={node.recessed ? 'Floor' : 'Surface'}
-          max={6}
+          max={20}
           min={-3}
           onChange={handleElevationChange}
           precision={3}
@@ -292,7 +294,7 @@ export function SlabPanel() {
 
         <SliderControl
           label={node.recessed ? 'Rim' : 'Base'}
-          max={6}
+          max={20}
           min={-3}
           onChange={handleAnchorChange}
           precision={3}
@@ -304,7 +306,7 @@ export function SlabPanel() {
         {node.recessed ? (
           <SliderControl
             label="Depth"
-            max={2}
+            max={1000}
             min={MIN_SLAB_THICKNESS}
             onChange={handleRecessDepthChange}
             precision={2}
@@ -315,7 +317,7 @@ export function SlabPanel() {
         ) : (
           <SliderControl
             label="Thickness"
-            max={0.5}
+            max={1000}
             min={MIN_SLAB_THICKNESS}
             onChange={handleThicknessChange}
             precision={2}

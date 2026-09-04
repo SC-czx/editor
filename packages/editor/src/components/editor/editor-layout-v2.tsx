@@ -77,6 +77,11 @@ function LeftColumn({
   // up to the minimum so the panel always returns to a usable size.
   const handleRailClick = useCallback(
     (id: string) => {
+      // noPanel tabs drive the stage, not the panel — leave collapse state alone.
+      if (tabs.find((t) => t.id === id)?.noPanel) {
+        setActivePanel(id)
+        return
+      }
       if (isCollapsed) {
         setIsCollapsed(false)
         if (width < SIDEBAR_MIN_WIDTH) setWidth(SIDEBAR_MIN_WIDTH)
@@ -89,7 +94,7 @@ function LeftColumn({
       }
       setActivePanel(id)
     },
-    [isCollapsed, width, activePanel, setIsCollapsed, setWidth, setActivePanel],
+    [tabs, isCollapsed, width, activePanel, setIsCollapsed, setWidth, setActivePanel],
   )
 
   useEffect(() => {
@@ -126,7 +131,7 @@ function LeftColumn({
         onIconClick={handleRailClick}
         tabs={tabs}
       />
-      {!isCollapsed && (
+      {!isCollapsed && !tabs.find((t) => t.id === activePanel)?.noPanel && (
         <div
           className="relative flex h-full flex-col"
           style={{
@@ -183,8 +188,15 @@ function RightColumn({
           <div className="pointer-events-auto flex items-center gap-2">{toolbarRight}</div>
         </div>
       )}
-      {/* Canvas area */}
-      <div className="relative flex-1 overflow-hidden">{children}</div>
+      {/* Canvas area. `isolate` matters: drei's `<Html>` computes a z-index
+          from camera distance and defaults to a range topping out at
+          16,777,271, and without a stacking context here those values compete
+          directly with the viewer toolbar (z-20), the stage overlay (z-10) and
+          the overlay band (z-30) — so an in-scene tool badge painted over all
+          three. Isolating pins every in-scene HTML layer inside the canvas,
+          where it belongs, and leaves their order relative to each other
+          untouched. */}
+      <div className="relative isolate flex-1 overflow-hidden">{children}</div>
       {/* Stage overlay — replaces the canvas visually (e.g. studio gallery)
           while keeping it mounted. Sits below the viewer toolbar (z-20) so
           the stage switch stays reachable. */}
@@ -239,7 +251,7 @@ export function EditorLayoutV2({
         overlays={overlays}
         renderTabContent={renderTabContent}
         sidebarOverlay={sidebarOverlay}
-        sidebarTabs={sidebarTabs}
+        sidebarTabs={sidebarTabs.filter((t) => !t.noPanel)}
         viewerContent={viewerContent}
         viewerToolbarLeft={viewerToolbarLeft}
         viewerToolbarRight={viewerToolbarRight}

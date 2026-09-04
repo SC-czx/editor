@@ -4,11 +4,15 @@ import {
   type AnyNode,
   type AnyNodeId,
   createDefaultRidgeVentsForSegment,
+  getConicalRoofCoverage,
+  isAutoGutterEnabled,
   isAutoRidgeVentEnabled,
   isDefaultRidgeVentNode,
+  normalizeRoofSegmentTrim,
   ROOF_SHAPE_DEFAULTS,
   type RoofSegmentNode,
   RoofSegmentNode as RoofSegmentNodeSchema,
+  type RoofSegmentTrim,
   type RoofType,
   useScene,
 } from '@pascal-app/core'
@@ -24,7 +28,7 @@ import {
   useEditor,
 } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
-import { Copy, Move, Trash2 } from 'lucide-react'
+import { Check, Copy, Move, Pencil, RotateCcw, Trash2 } from 'lucide-react'
 import { useCallback } from 'react'
 
 const ROOF_TYPE_OPTIONS: { label: string; value: RoofType }[] = [
@@ -40,6 +44,10 @@ const ROOF_TYPE_OPTIONS_2: { label: string; value: RoofType }[] = [
   { label: 'Mansard', value: 'mansard' },
 ]
 
+const ROOF_TYPE_OPTIONS_3: { label: string; value: RoofType }[] = [
+  { label: 'Conical', value: 'conical' },
+]
+
 // Carpenter / roofer convention: rise over a 12" run, converted to degrees.
 // atan(3/12) ≈ 14.04°, atan(6/12) ≈ 26.57°, atan(9/12) ≈ 36.87°, atan(12/12) = 45°.
 const PITCH_PRESETS: { label: string; deg: number }[] = [
@@ -49,8 +57,36 @@ const PITCH_PRESETS: { label: string; deg: number }[] = [
   { label: '12/12', deg: 45 },
 ]
 
+const EMPTY_TRIM: RoofSegmentTrim = {
+  left: 0,
+  right: 0,
+  front: 0,
+  back: 0,
+  frontLeft: 0,
+  frontRight: 0,
+  backLeft: 0,
+  backRight: 0,
+  frontLeftX: 0,
+  frontLeftZ: 0,
+  frontRightX: 0,
+  frontRightZ: 0,
+  backLeftX: 0,
+  backLeftZ: 0,
+  backRightX: 0,
+  backRightZ: 0,
+}
+
+function hasSegmentTrim(node: RoofSegmentNode): boolean {
+  return Object.values(normalizeRoofSegmentTrim(node)).some((value) => value > 0)
+}
+
 function shouldShowTrimPlanes(metadata: unknown): boolean {
   return metadataRecord(metadata).showTrimPlanes === true
+}
+
+function isManagedLeanToRoofSegment(metadata: unknown): boolean {
+  const record = metadataRecord(metadata)
+  return record.managedByLeanTo !== undefined && record.leanToRole === 'roof-segment'
 }
 
 function metadataRecord(metadata: unknown): Record<string, unknown> {
@@ -77,6 +113,13 @@ export default function RoofSegmentPanel() {
     if (current?.type !== 'roof-segment') return false
     return isAutoRidgeVentEnabled(current, s.nodes)
   })
+  const autoGutterEnabled = useScene((s) => {
+    const current = selectedId
+      ? (s.nodes[selectedId as AnyNode['id']] as RoofSegmentNode | undefined)
+      : undefined
+    if (current?.type !== 'roof-segment') return false
+    return isAutoGutterEnabled(current, s.nodes)
+  })
 
   const handleUpdate = useCallback(
     (updates: Partial<RoofSegmentNode>) => {
@@ -88,35 +131,67 @@ export default function RoofSegmentPanel() {
 
   const handleRoofTypeChange = useCallback(
     (roofType: RoofType) => {
+      if (isManagedLeanToRoofSegment(node?.metadata)) return
+      if (roofType === 'conical' && node) {
+        const scene = useScene.getState()
+        const defaultVentIds = (node.children ?? []).filter((childId) =>
+          isDefaultRidgeVentNode(scene.nodes[childId as AnyNodeId], node.id),
+        ) as AnyNodeId[]
+        if (defaultVentIds.length > 0) scene.deleteNodes(defaultVentIds)
+      }
       // Switching to Dutch resets the shape parameters to their defaults so the
       // gablet is well-formed regardless of the leftover values from the
       // previous roof type.
       handleUpdate(
-        roofType === 'dutch'
+        roofType === 'conical'
           ? {
               roofType,
-              dutchHipWidthRatio: ROOF_SHAPE_DEFAULTS.dutchHipWidthRatio,
-              dutchHipHeightRatio: ROOF_SHAPE_DEFAULTS.dutchHipHeightRatio,
-              dutchWaistLengthRatio: ROOF_SHAPE_DEFAULTS.dutchWaistLengthRatio,
-              dutchGabletRake: ROOF_SHAPE_DEFAULTS.dutchGabletRake,
-              dutchTopRakeThickness: ROOF_SHAPE_DEFAULTS.dutchTopRakeThickness,
+              depth: node?.width ?? 8,
+              rotation: 0,
+              trim: EMPTY_TRIM,
+              conicalFullCircle: true,
+              metadata: {
+                ...metadataRecord(node?.metadata),
+                autoGutter: false,
+                autoRidgeVent: false,
+                showTrimPlanes: false,
+              },
             }
-          : { roofType },
+          : roofType === 'dutch'
+            ? {
+                roofType,
+                dutchHipWidthRatio: ROOF_SHAPE_DEFAULTS.dutchHipWidthRatio,
+                dutchHipHeightRatio: ROOF_SHAPE_DEFAULTS.dutchHipHeightRatio,
+                dutchWaistLengthRatio: ROOF_SHAPE_DEFAULTS.dutchWaistLengthRatio,
+                dutchGabletRake: ROOF_SHAPE_DEFAULTS.dutchGabletRake,
+                dutchTopRakeThickness: ROOF_SHAPE_DEFAULTS.dutchTopRakeThickness,
+              }
+            : { roofType },
       )
     },
-    [handleUpdate],
+    [handleUpdate, node],
   )
 
   const handleClose = useCallback(() => {
+    if (node && shouldShowTrimPlanes(node.metadata)) {
+      updateNode(node.id, {
+        metadata: { ...metadataRecord(node.metadata), showTrimPlanes: false },
+      })
+    }
     setSelection({ selectedIds: [] })
-  }, [setSelection])
+  }, [node, setSelection, updateNode])
 
   const handleBack = useCallback(() => {
     if (node?.parentId) {
+      if (shouldShowTrimPlanes(node.metadata)) {
+        updateNode(node.id, {
+          metadata: { ...metadataRecord(node.metadata), showTrimPlanes: false },
+        })
+      }
       setRoofHostDragArmedId(node.parentId as AnyNodeId)
       setSelection({ selectedIds: [node.parentId] })
     }
-  }, [node?.parentId, setRoofHostDragArmedId, setSelection])
+  }, [node, setRoofHostDragArmedId, setSelection, updateNode])
 
   const handleDuplicate = useCallback(() => {
     if (!node?.parentId) return
@@ -205,9 +280,41 @@ export default function RoofSegmentPanel() {
     [selectedId],
   )
 
+  const handleAutoGutterToggle = useCallback(
+    (checked: boolean) => {
+      if (!selectedId) return
+      const scene = useScene.getState()
+      const current = scene.nodes[selectedId as AnyNodeId] as RoofSegmentNode | undefined
+      if (current?.type !== 'roof-segment') return
+      scene.updateNode(selectedId as AnyNodeId, {
+        metadata: { ...metadataRecord(current.metadata), autoGutter: checked },
+      })
+    },
+    [selectedId],
+  )
+
+  const handleTrimEditing = useCallback(
+    (editing: boolean) => {
+      if (!node) return
+      triggerSFX('sfx:item-pick')
+      handleUpdate({
+        metadata: { ...metadataRecord(node.metadata), showTrimPlanes: editing },
+      })
+    },
+    [handleUpdate, node],
+  )
+
+  const handleResetTrim = useCallback(() => {
+    if (!node || !hasSegmentTrim(node)) return
+    triggerSFX('sfx:item-pick')
+    handleUpdate({ trim: EMPTY_TRIM })
+  }, [handleUpdate, node])
+
   if (!(node && node.type === 'roof-segment' && selectedId)) return null
 
   const showTrimPlanes = shouldShowTrimPlanes(node.metadata)
+  const managedLeanToRoofSegment = isManagedLeanToRoofSegment(node.metadata)
+  const conicalCoverage = getConicalRoofCoverage(node)
 
   return (
     <PanelWrapper
@@ -222,60 +329,147 @@ export default function RoofSegmentPanel() {
           onChange={(v) => handleRoofTypeChange(v)}
           options={ROOF_TYPE_OPTIONS}
           value={node.roofType}
+          disabled={managedLeanToRoofSegment}
         />
         <SegmentedControl
           onChange={(v) => handleRoofTypeChange(v)}
           options={ROOF_TYPE_OPTIONS_2}
           value={node.roofType}
+          disabled={managedLeanToRoofSegment}
+        />
+        <SegmentedControl
+          onChange={(v) => handleRoofTypeChange(v)}
+          options={ROOF_TYPE_OPTIONS_3}
+          value={node.roofType}
+          disabled={managedLeanToRoofSegment}
         />
       </PanelSection>
 
-      <PanelSection title="Trim">
-        <ToggleControl
-          checked={showTrimPlanes}
-          label="Show trim planes"
-          onChange={(checked) =>
-            handleUpdate({
-              metadata: { ...metadataRecord(node.metadata), showTrimPlanes: checked },
-            })
-          }
-        />
-        {node.roofType !== 'shed' && node.roofType !== 'flat' && (
+      {node.roofType !== 'conical' && (
+        <PanelSection title="Trim">
+          <ActionGroup>
+            <ActionButton
+              icon={
+                showTrimPlanes ? (
+                  <Check className="h-3.5 w-3.5" />
+                ) : (
+                  <Pencil className="h-3.5 w-3.5" />
+                )
+              }
+              label={showTrimPlanes ? 'Done editing' : 'Edit footprint'}
+              onClick={() => (showTrimPlanes ? handleBack() : handleTrimEditing(true))}
+            />
+            <ActionButton
+              className="disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={!hasSegmentTrim(node)}
+              icon={<RotateCcw className="h-3.5 w-3.5" />}
+              label="Reset"
+              onClick={handleResetTrim}
+            />
+          </ActionGroup>
+          {node.roofType !== 'shed' && node.roofType !== 'flat' && (
+            <ToggleControl
+              checked={autoRidgeVentEnabled}
+              label="Auto ridge vent"
+              onChange={handleAutoRidgeVentToggle}
+            />
+          )}
+        </PanelSection>
+      )}
+
+      {node.roofType !== 'conical' && (
+        <PanelSection title="Drainage">
           <ToggleControl
-            checked={autoRidgeVentEnabled}
-            label="Auto ridge vent"
-            onChange={handleAutoRidgeVentToggle}
+            checked={autoGutterEnabled}
+            label="Auto gutters"
+            onChange={handleAutoGutterToggle}
           />
+        </PanelSection>
+      )}
+
+      <PanelSection title="Footprint">
+        {node.roofType === 'conical' ? (
+          <SliderControl
+            label="Diameter"
+            max={1000}
+            min={0.5}
+            onChange={(v) => handleUpdate({ width: v, depth: v })}
+            precision={2}
+            step={0.5}
+            unit="m"
+            value={Math.round(node.width * 100) / 100}
+          />
+        ) : (
+          <>
+            <SliderControl
+              label="Width"
+              max={1000}
+              min={0.5}
+              onChange={(v) => handleUpdate({ width: v })}
+              precision={2}
+              step={0.5}
+              unit="m"
+              value={Math.round(node.width * 100) / 100}
+            />
+            <SliderControl
+              label="Depth"
+              max={1000}
+              min={0.5}
+              onChange={(v) => handleUpdate({ depth: v })}
+              precision={2}
+              step={0.5}
+              unit="m"
+              value={Math.round(node.depth * 100) / 100}
+            />
+          </>
         )}
       </PanelSection>
 
-      <PanelSection title="Footprint">
-        <SliderControl
-          label="Width"
-          max={25}
-          min={0.5}
-          onChange={(v) => handleUpdate({ width: v })}
-          precision={2}
-          step={0.5}
-          unit="m"
-          value={Math.round(node.width * 100) / 100}
-        />
-        <SliderControl
-          label="Depth"
-          max={25}
-          min={0.5}
-          onChange={(v) => handleUpdate({ depth: v })}
-          precision={2}
-          step={0.5}
-          unit="m"
-          value={Math.round(node.depth * 100) / 100}
-        />
-      </PanelSection>
+      {node.roofType === 'conical' && (
+        <PanelSection title="Conical Shape">
+          <ToggleControl
+            checked={!conicalCoverage.fullCircle}
+            label="Clipped version"
+            onChange={(checked) => handleUpdate({ conicalFullCircle: !checked })}
+          />
+          {!conicalCoverage.fullCircle && (
+            <>
+              <SliderControl
+                label="Start Angle"
+                max={180}
+                min={-180}
+                onChange={(degrees) =>
+                  handleUpdate({ conicalStartAngle: (degrees * Math.PI) / 180 })
+                }
+                precision={0}
+                step={1}
+                unit="°"
+                value={Math.round((conicalCoverage.startAngle * 180) / Math.PI)}
+              />
+              <SliderControl
+                label="Arc"
+                max={345}
+                min={15}
+                onChange={(degrees) =>
+                  handleUpdate({
+                    conicalSweepAngle:
+                      (Math.sign(conicalCoverage.sweepAngle) * degrees * Math.PI) / 180,
+                  })
+                }
+                precision={0}
+                step={1}
+                unit="°"
+                value={Math.round((Math.abs(conicalCoverage.sweepAngle) * 180) / Math.PI)}
+              />
+            </>
+          )}
+        </PanelSection>
+      )}
 
       <PanelSection title="Wall Height">
         <SliderControl
           label="Wall"
-          max={5}
+          max={1000}
           min={0}
           onChange={(v) => handleUpdate({ wallHeight: v })}
           precision={2}
@@ -468,8 +662,6 @@ export default function RoofSegmentPanel() {
       <PanelSection title="Position">
         <SliderControl
           label="X"
-          max={50}
-          min={-50}
           onChange={(v) => {
             const pos = [...node.position] as [number, number, number]
             pos[0] = v
@@ -482,8 +674,6 @@ export default function RoofSegmentPanel() {
         />
         <SliderControl
           label="Y"
-          max={50}
-          min={-50}
           onChange={(v) => {
             const pos = [...node.position] as [number, number, number]
             pos[1] = v
@@ -496,8 +686,6 @@ export default function RoofSegmentPanel() {
         />
         <SliderControl
           label="Z"
-          max={50}
-          min={-50}
           onChange={(v) => {
             const pos = [...node.position] as [number, number, number]
             pos[2] = v
@@ -508,34 +696,38 @@ export default function RoofSegmentPanel() {
           unit="m"
           value={Math.round(node.position[2] * 100) / 100}
         />
-        <SliderControl
-          label="Rotation"
-          max={180}
-          min={-180}
-          onChange={(degrees) => {
-            handleUpdate({ rotation: (degrees * Math.PI) / 180 })
-          }}
-          precision={0}
-          step={1}
-          unit="°"
-          value={Math.round((node.rotation * 180) / Math.PI)}
-        />
-        <div className="flex gap-1.5 px-1 pt-2 pb-1">
-          <ActionButton
-            label="-45°"
-            onClick={() => {
-              triggerSFX('sfx:item-rotate')
-              handleUpdate({ rotation: node.rotation - Math.PI / 4 })
-            }}
-          />
-          <ActionButton
-            label="+45°"
-            onClick={() => {
-              triggerSFX('sfx:item-rotate')
-              handleUpdate({ rotation: node.rotation + Math.PI / 4 })
-            }}
-          />
-        </div>
+        {(node.roofType !== 'conical' || !conicalCoverage.fullCircle) && (
+          <>
+            <SliderControl
+              label="Rotation"
+              max={180}
+              min={-180}
+              onChange={(degrees) => {
+                handleUpdate({ rotation: (degrees * Math.PI) / 180 })
+              }}
+              precision={0}
+              step={1}
+              unit="°"
+              value={Math.round((node.rotation * 180) / Math.PI)}
+            />
+            <div className="flex gap-1.5 px-1 pt-2 pb-1">
+              <ActionButton
+                label="-45°"
+                onClick={() => {
+                  triggerSFX('sfx:item-rotate')
+                  handleUpdate({ rotation: node.rotation - Math.PI / 4 })
+                }}
+              />
+              <ActionButton
+                label="+45°"
+                onClick={() => {
+                  triggerSFX('sfx:item-rotate')
+                  handleUpdate({ rotation: node.rotation + Math.PI / 4 })
+                }}
+              />
+            </div>
+          </>
+        )}
       </PanelSection>
 
       <PanelSection title="Actions">

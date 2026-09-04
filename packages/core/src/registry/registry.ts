@@ -1,10 +1,59 @@
 import type { ZodObject } from 'zod'
-import type { AnyNodeDefinition, BakePolicy, NodeRegistry, Plugin } from './types'
+import type {
+  AnyNodeDefinition,
+  BakePolicy,
+  InspectorExtension,
+  NodeRegistry,
+  Plugin,
+} from './types'
 
 const HOST_API_VERSION = 1 as const
 const BUILTIN_PLUGIN_ID = 'pascal:core'
 
 const pluginIdsByKind = new Map<string, string>()
+
+// Inspector-card sections contributed by plugins, fanned out per node kind
+// (`Plugin.inspectorExtensions`). Filled by `loadPlugin`, cleared by the
+// test reset alongside `pluginIdsByKind`. Consumers re-derive on the
+// registry-version bump — plugins load asynchronously, after first mount.
+const inspectorExtensionsByKind = new Map<string, InspectorExtension[]>()
+
+// ---------------------------------------------------------------------------
+// Registry change notification. Plugin kinds register ASYNCHRONOUSLY (app
+// bootstraps discover them via dynamic imports — see `discoverPlugins`), so
+// any consumer that snapshots the registry at mount (the selection managers'
+// `getSelectableKinds()` subscription lists) goes stale the moment a plugin
+// loads after it. `_register` / `_reset` bump a monotonic version and notify
+// listeners; `useRegistryVersion()` (registry/use-registry-version.ts) turns
+// that into a React re-render so effects can re-derive their kind lists.
+// ---------------------------------------------------------------------------
+
+let registryVersion = 0
+const registryListeners = new Set<() => void>()
+
+function notifyRegistryChanged(): void {
+  registryVersion += 1
+  // Copy before iterating — a listener may unsubscribe (or subscribe) as a
+  // consequence of the notification.
+  for (const listener of [...registryListeners]) listener()
+}
+
+/** Monotonic counter, bumped on every kind registration (and test reset). */
+export function getRegistryVersion(): number {
+  return registryVersion
+}
+
+/**
+ * Subscribe to registry changes (a kind registered via {@link registerNode}
+ * / {@link loadPlugin}, or a test reset). Returns the unsubscribe function.
+ * `useSyncExternalStore`-compatible.
+ */
+export function onRegistryChange(listener: () => void): () => void {
+  registryListeners.add(listener)
+  return () => {
+    registryListeners.delete(listener)
+  }
+}
 
 // True in dev / test builds, false in production. Tries Vite's
 // `import.meta.env.DEV` first (the editor app's bundler) and falls back
@@ -72,18 +121,47 @@ class NodeRegistryImpl implements NodeRegistry {
       }
     }
     this.defs.set(def.kind, def)
+    notifyRegistryChanged()
   }
 
   // Test-only — clears the registry. Not exported from the package barrel.
   _reset(): void {
     this.defs.clear()
     pluginIdsByKind.clear()
+    inspectorExtensionsByKind.clear()
+    notifyRegistryChanged()
+  }
+
+  // Test-only — captures the registry (definitions + plugin bookkeeping) and
+  // returns a restore function. The registry is a module singleton and bun
+  // runs a package's test files sequentially in ONE process, so a test that
+  // registers a throwaway kind (or `_reset()`s) without restoring leaks that
+  // state into every later test FILE — and file order varies by platform
+  // (macOS vs CI Linux), which turns the leak into an order-dependent flake.
+  // Wrap registry mutations in `const restore = nodeRegistry._snapshot()`
+  // + `restore()` in `afterEach`/`finally`.
+  _snapshot(): () => void {
+    const defs = new Map(this.defs)
+    const pluginIds = new Map(pluginIdsByKind)
+    const extensions = new Map(
+      Array.from(inspectorExtensionsByKind, ([kind, list]) => [kind, [...list]] as const),
+    )
+    return () => {
+      this.defs.clear()
+      for (const [kind, def] of defs) this.defs.set(kind, def)
+      pluginIdsByKind.clear()
+      for (const [kind, id] of pluginIds) pluginIdsByKind.set(kind, id)
+      inspectorExtensionsByKind.clear()
+      for (const [kind, list] of extensions) inspectorExtensionsByKind.set(kind, [...list])
+      notifyRegistryChanged()
+    }
   }
 }
 
 export const nodeRegistry: NodeRegistry & {
   _register: (def: AnyNodeDefinition) => void
   _reset: () => void
+  _snapshot: () => () => void
 } = new NodeRegistryImpl()
 
 export function registerNode(def: AnyNodeDefinition): void {
@@ -93,6 +171,17 @@ export function registerNode(def: AnyNodeDefinition): void {
 /** The plugin that registered a node kind, when it came through {@link loadPlugin}. */
 export function getNodePluginId(kind: string): string | undefined {
   return pluginIdsByKind.get(kind)
+}
+
+/**
+ * Inspector-card sections registered for a node kind
+ * ({@link InspectorExtension}), in plugin load order. Callers must still
+ * apply the project's install gate (`installedPlugins` — same rule as
+ * {@link isNodeKindEnabled}) before rendering. Re-derive on the
+ * registry-version bump: plugins register asynchronously after mount.
+ */
+export function getInspectorExtensions(kind: string): InspectorExtension[] {
+  return inspectorExtensionsByKind.get(kind) ?? []
 }
 
 /**
@@ -267,6 +356,26 @@ export async function loadPlugin(plugin: Plugin): Promise<void> {
     registerNode(def)
     pluginIdsByKind.set(def.kind, plugin.id)
   }
+  let extensionsChanged = false
+  for (const extension of plugin.inspectorExtensions ?? []) {
+    for (const kind of extension.kinds) {
+      const list = inspectorExtensionsByKind.get(kind)
+      if (!list) {
+        inspectorExtensionsByKind.set(kind, [extension])
+        extensionsChanged = true
+        continue
+      }
+      // Same-id re-registration replaces in place (dev HMR re-runs
+      // `loadPlugin`); a fresh id appends in load order.
+      const existing = list.findIndex((e) => e.id === extension.id)
+      if (existing >= 0) list[existing] = extension
+      else list.push(extension)
+      extensionsChanged = true
+    }
+  }
+  // Nodes already notified per `registerNode`; bump once more so a plugin
+  // that only contributes inspector extensions still re-renders consumers.
+  if (extensionsChanged) notifyRegistryChanged()
 }
 
 /**

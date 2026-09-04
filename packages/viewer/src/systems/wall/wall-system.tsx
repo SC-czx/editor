@@ -39,12 +39,14 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 import { Brush, Evaluator, SUBTRACTION } from 'three-bvh-csg'
 import { computeBoundsTree } from 'three-mesh-bvh'
 import { ensureRenderableGeometryAttributes, prepareBrushForCSG } from '../../lib/csg-utils'
+import { setGroupsSortedByMaterial } from '../../lib/geometry-groups'
 import { buildTerrainPerimeterFillGeometry } from '../../lib/terrain-perimeter-fill'
 import { clearLevelMiterCache, getCachedLevelMiters } from './level-miter-cache'
 import {
   buildOpeningCutoutGeometry,
   getOpeningCutoutBottomPadding,
 } from './opening-cutout-geometry'
+import { sweepUnbuiltWalls, WALL_PLACEHOLDER_SWEEP_INTERVAL } from './wall-placeholder-sweep'
 
 // Reusable CSG evaluator for better performance
 const csgEvaluator = new Evaluator()
@@ -333,21 +335,7 @@ function assignWallMaterialGroups(
     )
   }
 
-  geometry.clearGroups()
-
-  let currentMaterial = triangleMaterials[0] ?? 0
-  let groupStart = 0
-
-  for (let triangleIndex = 1; triangleIndex < triangleCount; triangleIndex += 1) {
-    const materialIndex = triangleMaterials[triangleIndex] ?? 0
-    if (materialIndex === currentMaterial) continue
-
-    geometry.addGroup(groupStart * 3, (triangleIndex - groupStart) * 3, currentMaterial)
-    groupStart = triangleIndex
-    currentMaterial = materialIndex
-  }
-
-  geometry.addGroup(groupStart * 3, (triangleCount - groupStart) * 3, currentMaterial)
+  setGroupsSortedByMaterial(geometry, triangleMaterials)
 }
 
 type SplitVertex = {
@@ -496,7 +484,22 @@ const WALL_PROGRESSIVE_TIME_BUDGET_MS = 8
 let lastWallDirtyAtMs = 0
 const pendingAdjacentByLevel = new Map<string, Set<string>>()
 
-function getPendingAdjacentCount() {
+// Walls whose geometry this system replaced since the last drain.
+//
+// The store's dirty mark is cleared the moment a wall is rebuilt, so anything
+// running later in the same frame would never see it. This is that same
+// signal, held until a consumer picks it up. Neighbours rebuilt by the
+// trailing-edge flush land here too — those never carry a dirty mark at all.
+const rebuiltWalls = new Set<string>()
+
+/** Moves every rebuild notice collected so far into `into`. */
+export function drainRebuiltWalls(into: Set<string>): void {
+  for (const wallId of rebuiltWalls) into.add(wallId)
+  rebuiltWalls.clear()
+}
+
+/** Rebuilds this system still owes — neighbours deferred during a drag. */
+export function getPendingWallRebuildCount(): number {
   let count = 0
   for (const ids of pendingAdjacentByLevel.values()) {
     count += ids.size
@@ -504,15 +507,17 @@ function getPendingAdjacentCount() {
   return count
 }
 
+let placeholderSweepCountdown = WALL_PLACEHOLDER_SWEEP_INTERVAL
+
 export const WallSystem = () => {
-  const dirtyNodes = useScene((state) => state.dirtyNodes)
+  // Subscribe so scene writes and override-only changes (no scene write)
+  // still re-run this component. The frame body reads the LIVE set via
+  // `useScene.getState()` — a closure over the subscribed value goes stale
+  // whenever the store REPLACES the set (scene load, plugin install) in the
+  // window before React commits the re-render, and marks added to the new
+  // set in that window would be invisible to the frame.
+  useScene((state) => state.dirtyNodes)
   const clearDirty = useScene((state) => state.clearDirty)
-  // Subscribe so override-only changes (no scene write) still re-run
-  // this component, which lets the gate below pick up the latest
-  // `dirtyNodes` set from the same render pass that received the
-  // override-publishing `markDirty` call. Without this, very fast
-  // drags could land an override and a markDirty in the same React
-  // tick and the next `useFrame` would still see the stale closure.
   useLiveNodeOverrides((s) => s.overrides)
 
   // The miter cache is module-level, so it outlives this mount. Editor
@@ -521,6 +526,25 @@ export const WallSystem = () => {
   useEffect(() => () => clearLevelMiterCache(), [])
 
   useFrame(() => {
+    // Self-heal: any registered wall still on its mount-time placeholder
+    // geometry with NO dirty mark gets re-marked, so a lost mark (system
+    // mounted late, suspense remount, mark consumed elsewhere) can never
+    // strand a wall as a degenerate point forever (QA f2 probe5/probe6 —
+    // scene loaded with the X-ray active never built any of its 24 walls).
+    placeholderSweepCountdown -= 1
+    if (placeholderSweepCountdown <= 0) {
+      placeholderSweepCountdown = WALL_PLACEHOLDER_SWEEP_INTERVAL
+      const sceneState = useScene.getState()
+      sweepUnbuiltWalls({
+        wallIds: sceneRegistry.byType.wall ?? [],
+        geometryOf: (wallId) =>
+          (sceneRegistry.nodes.get(wallId) as THREE.Mesh | undefined)?.geometry ?? null,
+        isDirty: (wallId) => sceneState.dirtyNodes.has(wallId as AnyNodeId),
+        markDirty: (wallId) => sceneState.markDirty(wallId as AnyNodeId),
+      })
+    }
+
+    const dirtyNodes = useScene.getState().dirtyNodes
     const hasDirty = dirtyNodes.size > 0
     const hasPending = pendingAdjacentByLevel.size > 0
     if (!hasDirty && !hasPending) return
@@ -588,6 +612,7 @@ export const WallSystem = () => {
         if (mesh) {
           updateWallGeometry(wallId, miterData)
           clearDirty(wallId as AnyNodeId)
+          rebuiltWalls.add(wallId)
           rebuiltWallIds.add(wallId)
           rebuiltWallsThisFrame += 1
         }
@@ -618,7 +643,7 @@ export const WallSystem = () => {
     // their correct miter joins.
     const quiet = !hasDirtyWalls && now - lastWallDirtyAtMs >= DRAG_FLUSH_MS
     if (quiet && pendingAdjacentByLevel.size > 0) {
-      const pendingCount = getPendingAdjacentCount()
+      const pendingCount = getPendingWallRebuildCount()
       const useProgressiveAdjacentRebuilds = pendingCount > WALL_PROGRESSIVE_DIRTY_THRESHOLD
       let rebuiltAdjacentThisFrame = 0
       const adjacentFrameStartedAt = performance.now()
@@ -641,7 +666,10 @@ export const WallSystem = () => {
           }
 
           const mesh = sceneRegistry.nodes.get(wallId) as THREE.Mesh
-          if (mesh) updateWallGeometry(wallId, miterData)
+          if (mesh) {
+            updateWallGeometry(wallId, miterData)
+            rebuiltWalls.add(wallId)
+          }
           pendingIds.delete(wallId)
           rebuiltAdjacentThisFrame += 1
         }

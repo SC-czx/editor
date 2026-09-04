@@ -2,15 +2,17 @@ import {
   clearSceneHistory,
   emitter,
   useScene,
+  type ParsedBuildJson,
   validateBuildJson,
 } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
 import { TreeView, VisualJson } from '@visual-json/react'
-import { Camera, Download, Map as MapIcon, Save, Trash2, Upload } from 'lucide-react'
+import { Camera, Check, Copy, Download, Map as MapIcon, Save, Trash2, Upload } from 'lucide-react'
 import {
   type KeyboardEvent,
   type SyntheticEvent,
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -23,12 +25,14 @@ import {
   DialogTitle,
   DialogTrigger,
 } from './../../../../../components/ui/primitives/dialog'
+import { Input } from './../../../../../components/ui/primitives/input'
 import { Switch } from './../../../../../components/ui/primitives/switch'
 import useEditor, { selectDefaultBuildingAndLevel } from './../../../../../store/use-editor'
 import useFloorplanMode from './../../../../../store/use-floorplan-mode'
 import { AudioSettingsDialog } from './audio-settings-dialog'
 import { KeyboardShortcutsDialog } from './keyboard-shortcuts-dialog'
 import { LoadBuildDialog, type PendingImport } from './load-build-dialog'
+import { PrintExportButton } from './print-export-button'
 
 type SceneNode = Record<string, unknown> & {
   id?: unknown
@@ -184,18 +188,24 @@ export function SettingsPanel({
   onVisibilityChange,
 }: SettingsPanelProps = {}) {
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const copyResetTimeoutRef = useRef<number | null>(null)
   const nodes = useScene((state) => state.nodes)
   const rootNodeIds = useScene((state) => state.rootNodeIds)
   const installedPlugins = useScene((state) => state.installedPlugins)
+  const materials = useScene((state) => state.materials)
   const setScene = useScene((state) => state.setScene)
   const clearScene = useScene((state) => state.clearScene)
   const resetSelection = useViewer((state) => state.resetSelection)
-  const exportScene = useViewer((state) => state.exportScene)
+  const modelExport = useEditor((state) => state.modelExport)
   const shadows = useViewer((state) => state.shadows)
   const setPhase = useEditor((state) => state.setPhase)
   const floorplanMode = useFloorplanMode((state) => state.mode)
   const [isGeneratingThumbnail, setIsGeneratingThumbnail] = useState(false)
+  const [exportOnlyVisible, setExportOnlyVisible] = useState(true)
   const [pendingImport, setPendingImport] = useState<PendingImport | null>(null)
+  const [projectIdCopyState, setProjectIdCopyState] = useState<'idle' | 'copied' | 'error'>(
+    'idle',
+  )
   const sceneGraphValue = useMemo(
     () => buildSceneGraphValue(nodes as Record<string, SceneNode>, rootNodeIds),
     [nodes, rootNodeIds],
@@ -211,10 +221,22 @@ export function SettingsPanel({
     }
   }, [])
 
+  useEffect(
+    () => () => {
+      if (copyResetTimeoutRef.current !== null) {
+        window.clearTimeout(copyResetTimeoutRef.current)
+      }
+    },
+    [],
+  )
+
   const isLocalProject = false // Props-based; only show cloud sections when projectId provided
 
   const handleSaveBuild = () => {
-    const sceneData = { nodes, rootNodeIds, installedPlugins }
+    // Materials ride along: nodes reference them by `scene:<id>` slot
+    // refs, so a save without the table produces a file whose custom
+    // finishes revert to defaults on the very Load Build path below.
+    const sceneData = { nodes, rootNodeIds, installedPlugins, materials }
     const json = JSON.stringify(sceneData, null, 2)
     const blob = new Blob([json], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
@@ -270,16 +292,16 @@ export function SettingsPanel({
     e.target.value = ''
   }
 
-  const handleConfirmImport = (parsed: {
-    nodes: Record<string, unknown>
-    rootNodeIds: string[]
-    installedPlugins?: string[]
-  }) => {
+  const handleConfirmImport = (parsed: ParsedBuildJson) => {
     const currentScene = useScene.getState()
     setScene(
       parsed.nodes as Parameters<typeof setScene>[0],
       parsed.rootNodeIds as Parameters<typeof setScene>[1],
       {
+        // Without this, every `scene:<id>` slot ref in the imported file
+        // pointed at a material that no longer existed — custom finishes
+        // silently reverted to defaults on import.
+        materials: parsed.materials,
         installedPlugins: parsed.installedPlugins ?? currentScene.installedPlugins,
         hasExplicitPluginInstallState:
           parsed.installedPlugins !== undefined || currentScene.hasExplicitPluginInstallState,
@@ -310,6 +332,25 @@ export function SettingsPanel({
     setTimeout(() => setIsGeneratingThumbnail(false), 3000)
   }
 
+  const handleCopyProjectId = async () => {
+    if (!projectId) return
+    if (copyResetTimeoutRef.current !== null) {
+      window.clearTimeout(copyResetTimeoutRef.current)
+    }
+
+    try {
+      await navigator.clipboard.writeText(projectId)
+      setProjectIdCopyState('copied')
+    } catch {
+      setProjectIdCopyState('error')
+    }
+
+    copyResetTimeoutRef.current = window.setTimeout(() => {
+      setProjectIdCopyState('idle')
+      copyResetTimeoutRef.current = null
+    }, 2000)
+  }
+
   const handleVisibilityChange = async (
     field: 'isPrivate' | 'showScansPublic' | 'showGuidesPublic',
     value: boolean,
@@ -319,6 +360,40 @@ export function SettingsPanel({
 
   return (
     <div className="flex flex-col gap-6 p-3">
+      {projectId && (
+        <div className="space-y-2">
+          <label className="font-medium text-muted-foreground text-xs uppercase">Project</label>
+          <div className="font-medium text-sm">Project ID</div>
+          <div className="flex items-center gap-2">
+            <Input
+              aria-label="Project ID"
+              className="font-mono text-xs"
+              readOnly
+              value={projectId}
+            />
+            <Button
+              aria-label={projectIdCopyState === 'copied' ? 'Project ID copied' : 'Copy project ID'}
+              className="rounded-full"
+              onClick={() => void handleCopyProjectId()}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {projectIdCopyState === 'copied' ? (
+                <Check className="size-3.5" />
+              ) : (
+                <Copy className="size-3.5" />
+              )}
+              {projectIdCopyState === 'copied'
+                ? 'Copied'
+                : projectIdCopyState === 'error'
+                  ? 'Try again'
+                  : 'Copy'}
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Visibility Section (only for cloud projects) */}
       {projectId && !isLocalProject && (
         <div className="space-y-3">
@@ -374,9 +449,18 @@ export function SettingsPanel({
 
         <div className="space-y-2">
           <div className="font-medium text-muted-foreground text-xs">3D model</div>
+          <div className="flex items-center justify-between gap-4 rounded-md border p-3">
+            <div>
+              <div className="font-medium text-sm">Visible nodes only</div>
+              <div className="text-muted-foreground text-xs">
+                Exclude hidden furniture and other hidden scene nodes
+              </div>
+            </div>
+            <Switch checked={exportOnlyVisible} onCheckedChange={setExportOnlyVisible} />
+          </div>
           <Button
             className="w-full justify-start gap-2"
-            onClick={() => exportScene?.('glb')}
+            onClick={() => modelExport?.('glb', { onlyVisible: exportOnlyVisible })}
             variant="outline"
           >
             <Download className="size-4" />
@@ -384,7 +468,7 @@ export function SettingsPanel({
           </Button>
           <Button
             className="w-full justify-start gap-2"
-            onClick={() => exportScene?.('stl')}
+            onClick={() => modelExport?.('stl', { onlyVisible: exportOnlyVisible })}
             variant="outline"
           >
             <Download className="size-4" />
@@ -392,12 +476,14 @@ export function SettingsPanel({
           </Button>
           <Button
             className="w-full justify-start gap-2"
-            onClick={() => exportScene?.('obj')}
+            onClick={() => modelExport?.('obj', { onlyVisible: exportOnlyVisible })}
             variant="outline"
           >
             <Download className="size-4" />
             Export OBJ
           </Button>
+
+          <PrintExportButton onlyVisible={exportOnlyVisible} />
         </div>
 
         <div className="space-y-2">

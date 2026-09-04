@@ -117,10 +117,10 @@ const exitToSelectAfterUnconsumedCancel = () => {
   // From zone mode, return to structure select
   if (currentPhase === 'structure' && currentStructureLayer === 'zones') {
     useEditor.getState().setStructureLayer('elements')
-    useEditor.getState().setMode('select')
+    useEditor.getState().armToolMode({ mode: 'select' })
   } else {
     // Return to the default select tool while keeping the active building/level context.
-    useEditor.getState().setMode('select')
+    useEditor.getState().armToolMode({ mode: 'select' })
   }
 
   useEditor.getState().setFloorplanSelectionTool('click')
@@ -141,6 +141,8 @@ const cancelInteractionForHistoryShortcut = () => {
     guideEmitter.emit('guide:cancel-reference-scale')
     return true
   }
+  const activeScope = useInteractionScope.getState().scope
+  if (activeScope.kind === 'mesh-editing' && activeScope.phase === 'selecting') return false
   _toolCancelConsumed = false
   emitter.emit('tool:cancel')
   if (_toolCancelConsumed) return true
@@ -162,6 +164,44 @@ const cancelInteractionForHistoryShortcut = () => {
   return false
 }
 
+export const runHistoryShortcut = (direction: 'undo' | 'redo') => {
+  if (cancelInteractionForHistoryShortcut()) return false
+  if (direction === 'redo') runRedo()
+  else runUndo()
+  return true
+}
+
+export const isToolOwnedRotation = () => {
+  const editor = useEditor.getState()
+  const moving = getMovingNode()
+  if (
+    moving?.type === 'door' ||
+    moving?.type === 'window' ||
+    moving?.type === 'item' ||
+    moving?.type === 'lean-to-extension'
+  )
+    return true
+  return (
+    editor.mode === 'build' &&
+    (editor.tool === 'door' ||
+      editor.tool === 'window' ||
+      editor.tool === 'roof' ||
+      editor.tool === 'item' ||
+      editor.tool === 'lean-to-extension')
+  )
+}
+
+export const isToolOwnedCanopyForm = () => {
+  const editor = useEditor.getState()
+  return editor.mode === 'build' && editor.tool === 'lean-to-extension'
+}
+
+export const canRunGlobalRotationShortcut = () =>
+  useInteractionScope.getState().scope.kind !== 'mesh-editing'
+
+export const canCycleSnappingModeShortcut = (hasActiveContext = getActiveSnapContext() != null) =>
+  hasActiveContext
+
 export const useKeyboard = ({
   isVersionPreviewMode = false,
   disabled = false,
@@ -174,32 +214,30 @@ export const useKeyboard = ({
       return
     }
 
-    // True while a door/window is being placed: either a fresh clone is moving
-    // (preset / duplicate path) or a door/window build tool is armed. The
-    // placement tool owns R/T then (flip the draft before commit), so the
-    // global selection-based R/T handler must stand down to avoid double-firing.
-    const isPlacingOpening = () => {
-      const ed = useEditor.getState()
-      const moving = getMovingNode()
-      if (moving?.type === 'door' || moving?.type === 'window') return true
-      return ed.mode === 'build' && (ed.tool === 'door' || ed.tool === 'window')
-    }
-
+    // True while an active placement tool owns R/T. Door/window tools flip the
+    // draft, item / lean-to placement rotates its draft, and the roof tool turns
+    // its draft axes. The global selection handler must stand down to avoid double-firing.
     // Shift cycles the snapping mode (and a clean-tap Ctrl the grid step)
     // whenever there's an active snapping context — i.e. exactly when the HUD
     // shows a snapping chip. That single source covers wall/fence/item drafting,
     // every node move (including wall-hosted items + door/window openings, which
     // now declare `snapProfile`), and endpoint/polygon reshaping, so the keys
     // never silently stop working. Force-place lives on Alt where a tool supports it.
-    const isSnappingCycleContext = () => getActiveSnapContext() != null
     // A "clean tap" of Ctrl/Meta (pressed and released with NO other key in
     // between) cycles the grid step — same context as the Shift snapping-mode
     // cycle. `ctrlTapClean` starts true the moment Ctrl/Meta goes down alone
     // and is cleared the instant any other key fires, so chords like Ctrl+Z /
     // Ctrl+C never cycle.
     let ctrlTapClean = false
+    let shiftTapClean = false
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        shiftTapClean = !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey
+      } else {
+        shiftTapClean = false
+      }
+
       if (e.key === 'Control' || e.key === 'Meta') {
         // Only a fresh, modifier-free press starts a clean-tap candidate;
         // ignore key-repeat and presses already part of a combo.
@@ -258,15 +296,6 @@ export const useKeyboard = ({
           setTerrainBrush({ radius })
           sfxEmitter.emit('sfx:grid-snap')
         }
-        return
-      }
-
-      if (e.key === 'Shift' && !e.repeat && isSnappingCycleContext()) {
-        // Cycle the global snapping mode (grid → lines → angles → off).
-        // `'off'` is the snap bypass now, so Shift no longer holds-to-bypass.
-        e.preventDefault()
-        useEditor.getState().cycleSnappingMode()
-        sfxEmitter.emit('sfx:grid-snap')
         return
       }
 
@@ -338,32 +367,28 @@ export const useKeyboard = ({
       } else if (e.key === '1' && !e.metaKey && !e.ctrlKey) {
         e.preventDefault()
         useEditor.getState().setPhase('site')
-        useEditor.getState().setMode('select')
+        useEditor.getState().armToolMode({ mode: 'select' })
       } else if (e.key === '2' && !e.metaKey && !e.ctrlKey) {
         e.preventDefault()
         useEditor.getState().setPhase('structure')
-        useEditor.getState().setMode('select')
+        useEditor.getState().armToolMode({ mode: 'select' })
       } else if (e.key === '3' && !e.metaKey && !e.ctrlKey) {
         e.preventDefault()
         useEditor.getState().setPhase('furnish')
-        useEditor.getState().setMode('select')
+        useEditor.getState().armToolMode({ mode: 'select' })
       } else if (e.key === 'f' && !e.metaKey && !e.ctrlKey) {
         if (isVersionPreviewMode) return
+        if (isToolOwnedCanopyForm()) return
         e.preventDefault()
         useEditor.getState().setPhase('furnish')
-        useEditor.getState().setMode('build')
-        // Set the item tool explicitly so the active tool never inherits a
-        // stale tool from a prior build session.
-        useEditor.getState().setTool('item')
+        useEditor.getState().armToolMode({ mode: 'build', tool: 'item' })
         useEditor.getState().setActiveSidebarPanel('items')
       } else if (e.key === 'z' && !e.metaKey && !e.ctrlKey) {
         if (isVersionPreviewMode) return
         e.preventDefault()
         useEditor.getState().setPhase('structure')
         useEditor.getState().setStructureLayer('zones')
-        useEditor.getState().setMode('build')
-        // Set the zone tool explicitly so it never inherits a stale tool.
-        useEditor.getState().setTool('zone')
+        useEditor.getState().armToolMode({ mode: 'build', tool: 'zone' })
       } else if (e.key === 'm' && !e.metaKey && !e.ctrlKey) {
         if (isVersionPreviewMode) return
         e.preventDefault()
@@ -371,39 +396,33 @@ export const useKeyboard = ({
         editor.setPhase('structure')
         editor.setStructureLayer('elements')
         editor.setToolDefaults('measurement', { kind: editor.lastMeasurementKind })
-        editor.setMode('build')
-        editor.setTool('measurement')
+        editor.armToolMode({ mode: 'build', tool: 'measurement' })
       }
       if (e.key === 'v' && !e.metaKey && !e.ctrlKey) {
         e.preventDefault()
-        useEditor.getState().setMode('select')
+        useEditor.getState().armToolMode({ mode: 'select' })
         useEditor.getState().setFloorplanSelectionTool('click')
       } else if (e.key === 'b' && !e.metaKey && !e.ctrlKey) {
         if (isVersionPreviewMode) return
         e.preventDefault()
         useEditor.getState().setPhase('structure')
         useEditor.getState().setStructureLayer('elements')
-        useEditor.getState().setMode('build')
-        // Set the wall tool explicitly so B never inherits a stale tool
-        // (e.g. fence) left over from a prior build session.
-        useEditor.getState().setTool('wall')
+        useEditor.getState().armToolMode({ mode: 'build', tool: 'wall' })
       } else if (e.key === 'x' && !e.metaKey && !e.ctrlKey) {
         if (isVersionPreviewMode) return
         e.preventDefault()
-        useEditor.getState().setMode('delete')
+        useEditor.getState().armToolMode({ mode: 'delete' })
       } else if (e.key === 'p' && !e.metaKey && !e.ctrlKey) {
         if (isVersionPreviewMode) return
         e.preventDefault()
-        useEditor.getState().primeMaterialPaintFromSelection()
         useEditor.getState().setPhase('structure')
         useEditor.getState().setStructureLayer('elements')
-        useEditor.getState().setMode('material-paint')
+        useEditor.getState().armMaterialPaint()
       } else if (e.key === 'g' && !e.metaKey && !e.ctrlKey) {
         if (isVersionPreviewMode) return
         e.preventDefault()
-        // G for ground. No `setPhase` — `setMode` moves to the site phase itself,
-        // and doing it here would set the phase twice with a mode reset between.
-        useEditor.getState().setMode('terrain-sculpt')
+        // G for ground. The ToolMode transition moves to the site phase itself.
+        useEditor.getState().armToolMode({ mode: 'terrain-sculpt' })
       } else if (e.key === 'c' && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
         if (isVersionPreviewMode) return
         e.preventDefault()
@@ -419,13 +438,11 @@ export const useKeyboard = ({
       } else if (e.key.toLowerCase() === 'z' && e.shiftKey && (e.metaKey || e.ctrlKey)) {
         if (isVersionPreviewMode) return
         e.preventDefault()
-        if (cancelInteractionForHistoryShortcut()) return
-        runRedo()
+        runHistoryShortcut('redo')
       } else if (e.key.toLowerCase() === 'z' && !e.shiftKey && (e.metaKey || e.ctrlKey)) {
         if (isVersionPreviewMode) return
         e.preventDefault()
-        if (cancelInteractionForHistoryShortcut()) return
-        runUndo()
+        runHistoryShortcut('undo')
       } else if (e.key === 'ArrowUp' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault()
         const { buildingId, levelId } = useViewer.getState().selection
@@ -473,7 +490,8 @@ export const useKeyboard = ({
         !e.metaKey &&
         !e.ctrlKey &&
         !isVersionPreviewMode &&
-        !isPlacingOpening()
+        !isToolOwnedRotation() &&
+        canRunGlobalRotationShortcut()
       ) {
         // `!metaKey && !ctrlKey` lets Cmd/Ctrl+R reach the browser reload instead
         // of rotating/flipping the selected node.
@@ -482,10 +500,9 @@ export const useKeyboard = ({
         // open/close toggle lives on E. Windows still use R to toggle
         // their open/closed state.
         //
-        // Skipped entirely while a door/window placement is active
-        // (`isPlacingOpening`): the placement tool owns R then (flip the draft
-        // before commit), and the user can have a node selected at the same
-        // time — without this guard both would fire (double flip + sfx).
+        // Skipped while an item, door, window, or roof placement owns rotation.
+        // The user can still have a node selected during placement; without this
+        // guard both the draft and the selection would rotate.
         //
         // References (guide/scan) live in `selectedReferenceId`, not the viewer
         // selection — check them first, like the Delete arm below.
@@ -565,7 +582,12 @@ export const useKeyboard = ({
             sfxEmitter.emit('sfx:item-rotate')
           }
         }
-      } else if ((e.key === 't' || e.key === 'T') && !isVersionPreviewMode && !isPlacingOpening()) {
+      } else if (
+        (e.key === 't' || e.key === 'T') &&
+        !isVersionPreviewMode &&
+        !isToolOwnedRotation() &&
+        canRunGlobalRotationShortcut()
+      ) {
         // Rotate selected node counter-clockwise
         // Multi-selection → group rotate, mirroring the R arm above.
         if (rotateGroupSelection(-1)) {
@@ -683,6 +705,23 @@ export const useKeyboard = ({
       }
     }
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        const wasClean = shiftTapClean
+        shiftTapClean = false
+        if (!wasClean) return
+        if (
+          e.target instanceof HTMLInputElement ||
+          e.target instanceof HTMLTextAreaElement ||
+          (e.target instanceof HTMLElement && e.target.isContentEditable)
+        ) {
+          return
+        }
+        if (!canCycleSnappingModeShortcut()) return
+        e.preventDefault()
+        useEditor.getState().cycleSnappingMode()
+        sfxEmitter.emit('sfx:grid-snap')
+        return
+      }
       if (e.key === 'Control' || e.key === 'Meta') {
         const wasClean = ctrlTapClean
         ctrlTapClean = false
@@ -692,7 +731,7 @@ export const useKeyboard = ({
         if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
           return
         }
-        if (!isSnappingCycleContext()) return
+        if (!canCycleSnappingModeShortcut()) return
         // Cycle the grid / measurement step (0.5 → 0.25 → 0.1 → 0.05).
         useEditor.getState().cycleGridSnapStep()
         sfxEmitter.emit('sfx:grid-snap')
@@ -706,6 +745,8 @@ export const useKeyboard = ({
     // registry move overlay) — safe only because none of them claim Ctrl/Cmd+G.
     // `e.code` keeps it on the physical G key across keyboard layouts.
     const handleSessionGroupKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Shift') shiftTapClean = false
+      if (e.key !== 'Control' && e.key !== 'Meta') ctrlTapClean = false
       if (
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLTextAreaElement ||

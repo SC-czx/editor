@@ -1,3 +1,4 @@
+import { mintHostPanel, mintPlugin } from '@mint/pascal-plugin'
 import {
   type AnyNodeDefinition,
   discoverPlugins,
@@ -8,6 +9,8 @@ import {
 } from '@pascal-app/core'
 import { registerEditorHostPanel } from '@pascal-app/editor'
 import { builtinPlugin } from '@pascal-app/nodes'
+import { bonesHostPanel, bonesPlugin } from '@pascal-app/plugin-bones'
+import { streetscapeHostPanel, streetscapePlugin } from '@pascal-app/plugin-streetscape'
 import { treesHostPanel, treesPlugin } from '@pascal-app/plugin-trees'
 
 // Idempotency guards: HMR can reload this module, but `registerNode`
@@ -85,6 +88,18 @@ export async function loadExternalPlugins(): Promise<void> {
 // so it is registered separately from the core plugin manifest.
 extendPluginDiscovery(async () => [treesPlugin])
 registerEditorHostPanel(treesHostPanel)
+extendPluginDiscovery(async () => [bonesPlugin])
+// Opt-in: Bones ships uninstalled — users enable it per scene from the
+// Plugins panel (engineering X-ray is a specialist view, not a default).
+registerEditorHostPanel({ ...bonesHostPanel, defaultInstalled: false })
+extendPluginDiscovery(async () => [mintPlugin])
+registerEditorHostPanel(mintHostPanel)
+extendPluginDiscovery(async () => [streetscapePlugin])
+// The upstream manifest still names 'Pascal' as creator; credit the author.
+registerEditorHostPanel({
+  ...streetscapeHostPanel,
+  creator: { name: 'Sudhir Yadav', url: 'https://github.com/sudhir9297' },
+})
 
 loadBuiltinsSync()
 void loadExternalPlugins()

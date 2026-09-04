@@ -4,8 +4,8 @@ import {
   type HandleDescriptor,
   type NodeDefinition,
 } from '@pascal-app/core'
-import { surfacePaintCapability } from '../shared/surface-paint'
 import { buildCupolaFloorplan } from './floorplan'
+import { cupolaPaint } from './paint'
 import { cupolaParametrics } from './parametrics'
 import { CupolaNode } from './schema'
 
@@ -15,6 +15,7 @@ const HEIGHT_HANDLE_OFFSET = 0.25
 const ROTATE_CORNER_OFFSET = 0.12
 const MIN_DIM = 0.3
 const MIN_HEIGHT = 0.4
+const CUPOLA_LOUVERS_DEFAULT = 'library:preset-metal'
 
 function getBodyMidY(n: CupolaNodeType): number {
   return Math.max(0.001, n.height) / 2
@@ -108,7 +109,7 @@ const cupolaHandles: HandleDescriptor<CupolaNodeType>[] = [
  */
 export const cupolaDefinition: NodeDefinition<typeof CupolaNode> = {
   kind: 'cupola',
-  schemaVersion: 1,
+  schemaVersion: 4,
   schema: CupolaNode,
   category: 'structure',
   surfaceRole: 'roof',
@@ -116,15 +117,23 @@ export const cupolaDefinition: NodeDefinition<typeof CupolaNode> = {
   defaults: () => {
     const stub = CupolaNodeSchema.parse({ id: 'cupola_default' as never, type: 'cupola' })
     const { id: _id, type: _type, ...rest } = stub
-    return rest
+    return {
+      ...rest,
+      slots: { ...(rest.slots ?? {}), louvers: CUPOLA_LOUVERS_DEFAULT },
+    }
   },
 
   capabilities: {
+    slots: () => [
+      { slotId: 'base', label: 'Base', default: 'library:preset-softwhite' },
+      { slotId: 'body', label: 'Body', default: 'library:preset-softwhite' },
+      { slotId: 'roof', label: 'Roof', default: 'library:preset-softwhite' },
+      { slotId: 'louvers', label: 'Louvers', default: CUPOLA_LOUVERS_DEFAULT },
+    ],
     selectable: { hitVolume: 'bbox' },
     duplicable: true,
     deletable: true,
-    // Single painted surface — registry-driven paint dispatch (see chimney).
-    paint: surfacePaintCapability,
+    paint: cupolaPaint,
     // Mounts on a roof segment via `roofSegmentId`. Sits ON TOP of the
     // slope — no `buildCut`, just the dirty cascade so the parent roof's
     // merged shell rebuilds when the cupola moves / resizes.
@@ -153,7 +162,7 @@ export const cupolaDefinition: NodeDefinition<typeof CupolaNode> = {
   presentation: {
     label: 'Cupola',
     description: 'Louvered roof lantern with a dome or pyramid cap and optional finial.',
-    icon: { kind: 'url', src: '/icons/roof.webp' },
+    icon: { kind: 'url', src: '/icons/cupola.webp' },
     paletteSection: 'structure',
     paletteOrder: 122,
   },

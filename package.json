@@ -3,12 +3,13 @@
   "private": true,
   "scripts": {
     "build": "turbo run build",
-    "dev": "set -a && . ./.env 2>/dev/null; set +a; turbo run dev --env-mode=loose",
+    "dev": "dotenv -e ./.env -e ./.env.defaults -- turbo run dev --env-mode=loose",
     "lint": "biome lint",
     "lint:fix": "biome lint --write",
     "format": "biome format --write",
     "format:check": "biome format",
     "check": "biome check",
+    "checks": "bun run check && bun run check-types",
     "check:fix": "biome check --write",
     "check-types": "turbo run check-types",
     "test": "turbo run test",
@@ -22,6 +23,7 @@
     "release:editor": "gh workflow run release.yml -f package=editor -f bump=patch",
     "release:nodes": "gh workflow run release.yml -f package=nodes -f bump=patch",
     "release:mcp": "gh workflow run release.yml -f package=mcp -f bump=patch",
+    "release:cli": "gh workflow run release.yml -f package=cli -f bump=patch",
     "release:minor": "gh workflow run release.yml -f package=all -f bump=minor",
     "release:major": "gh workflow run release.yml -f package=all -f bump=major"
   },

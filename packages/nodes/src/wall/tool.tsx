@@ -5,6 +5,7 @@ import {
   collectAlignmentAnchors,
   DEFAULT_LEVEL_HEIGHT,
   emitter,
+  GROUND_SUPPORT_ID,
   type GridEvent,
   getWallMiterBoundaryPoints,
   type LevelNode,
@@ -480,6 +481,7 @@ export const WallTool: React.FC = () => {
   // snapping onto the chain's own segments never reads as a join.
   const chainWallIds = useRef<string[]>([])
   const constructionPlane = useRef<HorizontalConstructionPlane | null>(null)
+  const flatConstructionBase = useRef(false)
   const buildingState = useRef(0)
   const [draftMeasurement, setDraftMeasurement] = useState<DraftMeasurementState>(null)
   const [axisGuide, setAxisGuide] = useState<DraftAxisGuideState>(null)
@@ -604,6 +606,7 @@ export const WallTool: React.FC = () => {
     const stopDrafting = () => {
       buildingState.current = 0
       constructionPlane.current = null
+      flatConstructionBase.current = false
       chainFirstVertex.current = null
       chainWallIds.current = []
       const draftPreview = useFloorplanDraftPreview.getState()
@@ -754,6 +757,7 @@ export const WallTool: React.FC = () => {
               : null) ?? resolveEventConstructionPlane(event, pointed)
         const plane = resampleTerrainConstructionPlane(resolvedPlane, snappedStart)
         constructionPlane.current = plane
+        flatConstructionBase.current = pointed?.sourceNodeId != null
         publishHorizontalConstructionPlane(event, plane)
         gridPosition = snappedStart
         startingPoint.current.set(snappedStart[0], plane.localY, snappedStart[1])
@@ -789,15 +793,24 @@ export const WallTool: React.FC = () => {
         const dx = snappedEnd[0] - startingPoint.current.x
         const dz = snappedEnd[1] - startingPoint.current.z
         if (dx * dx + dz * dz < 0.01 * 0.01) return
+        // A ground(terrain)-hosted chain keeps its frozen construction plane;
+        // any other chain re-resolves the aimed surface per commit so a later
+        // segment can still elect the slab it visibly crosses instead of
+        // being capped at the first click's elevation.
+        const draftPlane = constructionPlane.current
+        const commitPointed =
+          draftPlane?.supportSlabId === GROUND_SUPPORT_ID ? null : pointedSurfaceFor(event)
         // Both start and end are building-local ✓
         const createdWall = createWallOnCurrentLevel(
           [startingPoint.current.x, startingPoint.current.z],
           snappedEnd,
           {
-            supportCap: constructionPlane.current?.elevation ?? null,
-            preferredSupportSlabId: constructionPlane.current?.supportSlabId ?? null,
-            constructionElevation: constructionPlane.current?.elevation ?? null,
+            supportCap: commitPointed ? commitPointed.elevation : (draftPlane?.elevation ?? null),
+            preferredSupportSlabId: draftPlane?.supportSlabId ?? null,
+            constructionElevation: draftPlane?.elevation ?? null,
             constructionHeight: previewHeightRef.current,
+            constructionSourceNodeId: constructionPlane.current?.sourceNodeId ?? null,
+            flatConstructionBase: flatConstructionBase.current,
           },
         )
         if (!createdWall) return

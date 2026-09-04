@@ -1,15 +1,20 @@
 import {
   type AnyNodeId,
+  type DormerEvent,
+  dormerWallFacePointToDormer,
   emitter,
   type GridEvent,
+  holdHiddenWallPointerEvents,
   isCurvedWall,
   type RoofEvent,
   type RoofNode,
   sceneRegistry,
   spatialGridManager,
+  useLiveNodeOverrides,
   useLiveTransforms,
   useScene,
   type WallEvent,
+  type WindowEvent,
   WindowNode,
 } from '@pascal-app/core'
 import {
@@ -28,16 +33,28 @@ import {
   useAlignmentGuides,
   useEditor,
   useFacingPose,
+  useRegistryToolContext,
 } from '@pascal-app/editor'
-import { useViewer } from '@pascal-app/viewer'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BoxGeometry, EdgesGeometry, type Group, Vector3 } from 'three'
 import { LineBasicNodeMaterial } from 'three/webgpu'
+import {
+  type DormerWindowTarget,
+  dormerEventFromHostedWindow,
+  getDormerWindowWorldNormal,
+  getDormerWindowWorldYaw,
+  resolveDormerWindowTarget,
+} from '../shared/dormer-wall-opening-placement'
 import {
   clearOpeningGuides3D,
   publishOpeningGuidesForWallEvent,
   resolveSillSnap,
 } from '../shared/opening-guides-runtime'
+import { beginOpeningMoveHistorySession } from '../shared/opening-move-history'
+import {
+  isWallMeshHidden,
+  shouldIgnoreWallEventForOpeningMove,
+} from '../shared/opening-move-wall-gate'
 import {
   getRoofWallOpeningCursorPose,
   type RoofWallOpeningTarget,
@@ -68,15 +85,18 @@ const edgeMaterial = new LineBasicNodeMaterial({
  * Move/duplicate tool for WindowNodes — wall-only, same guardrails as WindowTool.
  *
  * Move mode (metadata.isNew falsy):
- *   Adopts the existing window, pauses temporal. On commit: restores original state
- *   (clean undo baseline) then resumes + updateNode (undo reverts to original position).
- *   On cancel: restores original state.
+ *   Adopts the existing window and holds a refcounted history pause for the
+ *   gesture. On commit: restores original state (clean undo baseline) then runs
+ *   updateNode as the gesture's single tracked write (undo reverts to the
+ *   original position). On cancel: restores original state, never tracked.
  *
  * Duplicate mode (metadata.isNew = true):
- *   The node is a freshly created transient copy. On commit: deletes transient + resumes
- *   + createNode (undo removes the new window entirely). On cancel: deletes the node.
+ *   The node is a freshly created transient copy. On commit: deletes the
+ *   transient paused + createNode as the single tracked write (undo removes the
+ *   new window entirely). On cancel: deletes the node.
  */
 const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode }) => {
+  const { activeLevelId, isCameraDragging, selectNode } = useRegistryToolContext()
   const cursorGroupRef = useRef<Group>(null!)
 
   // The window preview ghost. Shown for the WHOLE move so the user always sees
@@ -116,7 +136,19 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
   }, [])
 
   useEffect(() => {
-    useScene.temporal.getState().pause()
+    // One undo entry per gesture: hold the REFCOUNTED history pause for the
+    // move's lifetime (a raw `temporal.pause()` is invisible to
+    // `getSceneHistoryPauseDepth()`, so a cooperating system's balanced
+    // pause/resume pair could zero the refcount mid-drag and resume tracking
+    // — every mid-drag write then became its own undo entry). The commit
+    // paths run their single tracked write through `history.commitStep`.
+    const history = beginOpeningMoveHistorySession()
+    // This tool's whole cursor model is the wall surface (`wall:enter` /
+    // `wall:move` / `wall:click`). Walls hidden by the wall-mode pass (X-ray
+    // 'down' mode) are pointer-transparent for selection; hold their pointer
+    // events for the move's lifetime so the window keeps sliding along its
+    // wall instead of detaching into the floor free-follow.
+    const releaseHiddenWallHold = holdHiddenWallPointerEvents()
 
     const meta =
       typeof movingWindowNode.metadata === 'object' && movingWindowNode.metadata !== null
@@ -131,6 +163,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       side: movingWindowNode.side,
       parentId: movingWindowNode.parentId,
       wallId: movingWindowNode.wallId,
+      dormerId: movingWindowNode.dormerId,
+      dormerFace: movingWindowNode.dormerFace,
       // Windows can be hosted on a roof-segment wall face. Moving onto a
       // wall re-anchors as wall-hosted (roofSegmentId cleared); reverts
       // must restore the roof host.
@@ -224,6 +258,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       event: WallEvent
     } | null = null
     let lastRoofEvent: RoofEvent | null = null
+    let lastDormerEvent: DormerEvent | null = null
+    let lastDormerTarget: DormerWindowTarget | null = null
 
     const markHostDirty = (hostId: string | null) => {
       if (hostId) useScene.getState().dirtyNodes.add(hostId as AnyNodeId)
@@ -240,7 +276,7 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       }
     }
 
-    const getLevelId = () => useViewer.getState().selection.levelId
+    const getLevelId = () => activeLevelId
     const getLevelYOffset = () => {
       const id = getLevelId()
       return id ? (sceneRegistry.nodes.get(id as AnyNodeId)?.position.y ?? 0) : 0
@@ -294,6 +330,22 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       group.rotation.y = cursorRotationY
       edgeMaterial.color.setHex(valid ? 0x22_c5_5e : 0xef_44_44)
     }
+
+    // While MOVING an existing window, a HIDDEN wall may drive the drag only
+    // if it is the window's own wall (grab wall / current mid-drag host) — an
+    // interposed hidden wall between the camera and the window's wall must
+    // not capture the drag and silently re-parent the window on commit
+    // (night-6 QA: an X-ray drag rode an invisible wall at z=-2.5 instead of
+    // the window's own wall at z=0). Ignored events are NOT
+    // stopPropagation'd, so the ray falls through to the own wall behind.
+    // Fresh placements (`isNew`) keep the all-walls behavior.
+    const wallEventIgnored = (event: WallEvent) =>
+      !isNew &&
+      shouldIgnoreWallEventForOpeningMove({
+        eventWallId: event.node.id,
+        eventWallHidden: isWallMeshHidden(event.node.id),
+        ownWallIds: [original.wallId, currentHostId],
+      })
 
     const resolveMoveTarget = (event: WallEvent) => {
       if (!isValidWallSideFace(event.normal)) return
@@ -364,6 +416,7 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
 
       const valid = !hasWallChildOverlap(
         event.node.id,
+        useScene.getState().nodes,
         clampedX,
         clampedY,
         movingWindowNode.width,
@@ -392,8 +445,13 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       tickGridStep(target.event.nativeEvent?.timeStamp ?? -1, target.clampedX)
       // Keep the REAL node hidden and show a tinted ghost in the wall opening —
       // green when placeable, red when it collides — matching the free-follow
-      // ghost so validity reads at a glance (see MoveDoorTool). The node position
-      // is still written so the wall cuts the hole at the right spot.
+      // ghost so validity reads at a glance (see MoveDoorTool). Reparenting
+      // MUST be a scene write: the wall's CSG merge and the renderer's nesting
+      // walk the wall's `children` array, which a live override never joins —
+      // an override-only reparent left the window uncut and rendered against
+      // its stale parent (no on-wall preview at all). A stale override from a
+      // free-follow / dormer hop would shadow those scene fields, so drop it.
+      useLiveNodeOverrides.getState().clear(movingWindowNode.id)
       if (currentHostId !== target.wallId) {
         useScene.getState().updateNode(movingWindowNode.id, {
           position: [target.clampedX, target.clampedY, 0],
@@ -403,6 +461,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
           wallId: target.wallId,
           roofSegmentId: undefined,
           roofFace: undefined,
+          dormerId: undefined,
+          dormerFace: undefined,
           visible: false,
         })
         markHostDirty(currentHostId)
@@ -478,6 +538,10 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
     }
 
     const onWallEnter = (event: WallEvent) => {
+      // Interposed hidden wall: ignore WITHOUT tearing down the current
+      // preview or stopping propagation — the own wall behind it (a later,
+      // farther intersection on this same ray) emits its own event.
+      if (wallEventIgnored(event)) return
       const target = resolveMoveTarget(event)
       if (!target) {
         onWallLeave()
@@ -494,6 +558,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
     }
 
     const onWallMove = (event: WallEvent) => {
+      // See onWallEnter — interposed hidden walls never own the move.
+      if (wallEventIgnored(event)) return
       if (!isValidWallSideFace(event.normal)) {
         onWallLeave()
         return
@@ -532,10 +598,10 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       let placedId: string
 
       if (isNew) {
-        // Duplicate mode: delete transient + resume + createNode
-        // Undo will remove the newly created node entirely
+        // Duplicate mode: delete the transient draft while history is still
+        // paused, then create the real node as the gesture's ONE tracked
+        // write — undo removes the new window entirely.
         useScene.getState().deleteNode(movingWindowNode.id)
-        useScene.temporal.getState().resume()
 
         const cloned = structuredClone(movingWindowNode) as any
         delete cloned.id
@@ -553,33 +619,39 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
           // Hidden during free-follow; the committed window must be visible.
           visible: true,
         })
-        useScene.getState().createNode(node, target.wallId as AnyNodeId)
+        history.commitStep(() => {
+          useScene.getState().createNode(node, target.wallId as AnyNodeId)
+        })
         placedId = node.id
       } else {
-        // Move mode: restore original (clean baseline) + resume + updateNode
-        // Undo will revert to the original position
+        // Move mode: restore the exact pre-drag state while history is still
+        // paused (the clean undo baseline), then apply the drop as the
+        // gesture's ONE tracked write — undo reverts to the original state.
         useScene.getState().updateNode(movingWindowNode.id, {
           position: original.position,
           rotation: original.rotation,
           side: original.side,
           parentId: original.parentId,
           wallId: original.wallId,
+          dormerId: original.dormerId,
+          dormerFace: original.dormerFace,
           roofSegmentId: original.roofSegmentId,
           roofFace: original.roofFace,
           metadata: original.metadata,
           visible: original.visible,
         })
-        useScene.temporal.getState().resume()
 
-        useScene.getState().updateNode(movingWindowNode.id, {
-          position: [target.clampedX, target.clampedY, 0],
-          rotation: [0, target.itemRotation, 0],
-          side: target.side,
-          parentId: target.wallId,
-          wallId: target.wallId,
-          roofSegmentId: undefined,
-          metadata: {},
-          visible: true,
+        history.commitStep(() => {
+          useScene.getState().updateNode(movingWindowNode.id, {
+            position: [target.clampedX, target.clampedY, 0],
+            rotation: [0, target.itemRotation, 0],
+            side: target.side,
+            parentId: target.wallId,
+            wallId: target.wallId,
+            roofSegmentId: undefined,
+            metadata: {},
+            visible: true,
+          })
         })
 
         if (original.parentId && original.parentId !== target.wallId) {
@@ -590,16 +662,18 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
 
       markHostDirty(target.wallId)
       useLiveTransforms.getState().clear(movingWindowNode.id)
-      useScene.temporal.getState().pause()
 
       triggerSFX('sfx:structure-build')
       hideCursor()
-      useViewer.getState().setSelection({ selectedIds: [placedId] })
+      selectNode(placedId as AnyNodeId)
       exitMoveMode()
     }
 
     const onWallClick = (event: WallEvent) => {
       if (committed) return
+      // A click on an interposed hidden wall must not commit / re-parent;
+      // let it fall through to the own wall behind (see onWallEnter).
+      if (wallEventIgnored(event)) return
       if (!isValidWallSideFace(event.normal)) return
       if (isCurvedWall(event.node)) return
       // Only interact with walls on the current level
@@ -634,12 +708,7 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       setGhostPose(null)
       useFacingPose.getState().clear()
       clearPlacementSurface()
-      const live = useScene.getState().nodes[movingWindowNode.id as AnyNodeId] as
-        | WindowNode
-        | undefined
-      if (live && live.visible === false) {
-        useScene.getState().updateNode(movingWindowNode.id, { visible: true })
-      }
+      useLiveNodeOverrides.getState().set(movingWindowNode.id, { visible: true })
     }
 
     // Free-follow: over open floor there's no wall to host the window, so hide
@@ -649,6 +718,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       freeFollowing = true
       lastTarget = null
       lastRoofEvent = null
+      lastDormerEvent = null
+      lastDormerTarget = null
       // No snap SFX here: the free-follow fires off-wall (an invalid red ghost,
       // not a placeable position) AND interleaves with the on-wall slide on the
       // same pointer move (R3F `wall:move` and DOM `grid:move` carry different
@@ -656,11 +727,15 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       // source of the constant click while sliding a window along a wall — the
       // on-wall `applyPreview` already ticks once per along-wall cell.
       hideCursor()
+      useLiveNodeOverrides.getState().clear(movingWindowNode.id)
       useLiveTransforms.getState().clear(movingWindowNode.id)
       const levelId = getLevelId()
       const sillCenterY = getSillCenterY()
       // Keep the R-flip visible while free-following (back = rotated π).
       const yaw = sideOverride === 'back' ? Math.PI : 0
+      // Scene writes, not overrides: leaving the wall must actually remove the
+      // window from the wall's `children` or the CSG cut trails the ghost
+      // around the old wall (see the wall-branch note in `applyPreview`).
       if (currentHostId !== levelId) {
         if (currentHostId && currentHostId !== levelId) markHostDirty(currentHostId)
         useScene.getState().updateNode(movingWindowNode.id, {
@@ -671,6 +746,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
           wallId: undefined,
           roofSegmentId: undefined,
           roofFace: undefined,
+          dormerId: undefined,
+          dormerFace: undefined,
           visible: false,
         })
         currentHostId = levelId
@@ -698,13 +775,207 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
 
     const onGridMove = (event: GridEvent) => {
       if (committed) return
-      if (useViewer.getState().cameraDragging) return
+      if (isCameraDragging()) return
       // A wall/roof handler owns the pointer right now — the cursor ray is on a
       // wall/roof that snaps, so skip the floor follow (see `wallOwnsPointer`).
       if (wallOwnsPointer()) return
       const [x, , z] = event.localPosition
       lastFloorPoint = [x, z]
       freeFollowAt(x, z)
+    }
+
+    // ── Dormer wall faces ──────────────────────────────────────────
+    const resolveDormerMoveTarget = (event: DormerEvent) =>
+      resolveDormerWindowTarget({
+        event,
+        width: movingWindowNode.width,
+        height: movingWindowNode.height,
+        ignoreId: movingWindowNode.id,
+        nodes: useScene.getState().nodes,
+        snap: snapToHalf,
+      })
+
+    const dormerWindowWorldPosition = (event: DormerEvent, target: DormerWindowTarget) => {
+      const point = new Vector3(
+        ...dormerWallFacePointToDormer(event.node, target.face, target.position),
+      )
+      event.object.localToWorld(point)
+      return [point.x, point.y, point.z] as [number, number, number]
+    }
+
+    const applyDormerPreview = (event: DormerEvent, target: DormerWindowTarget) => {
+      markWallOwnedPointer()
+      freeFollowing = false
+      lastTarget = null
+      lastRoofEvent = null
+      lastDormerEvent = event
+      lastDormerTarget = target
+      dragAnchor = null
+      grabWallId = null
+
+      const side = sideOverride ?? 'front'
+      const rotation: [number, number, number] = [0, side === 'back' ? Math.PI : 0, 0]
+      if (currentHostId !== target.dormer.id) {
+        markHostDirty(currentHostId)
+        currentHostId = target.dormer.id
+      }
+      useLiveNodeOverrides.getState().set(movingWindowNode.id, {
+        position: target.position,
+        rotation,
+        side,
+        parentId: target.dormer.id,
+        dormerId: target.dormer.id,
+        dormerFace: target.face,
+        wallId: undefined,
+        roofSegmentId: undefined,
+        roofFace: undefined,
+        visible: false,
+      })
+      const worldPosition = dormerWindowWorldPosition(event, target)
+      publishPlacementSurface(
+        new Vector3(...worldPosition),
+        getDormerWindowWorldNormal(event, target),
+      )
+      setGhostPose({
+        position: worldPosition,
+        rotationY: getDormerWindowWorldYaw(event, target),
+        tint: target.valid || altHeld ? 'valid' : 'invalid',
+        floorY: worldPosition[1],
+        side,
+      })
+      useFacingPose.getState().clear()
+      clearOpeningGuides3D()
+    }
+
+    const commitToDormer = (event: DormerEvent, target: DormerWindowTarget) => {
+      if (committed) return
+      committed = true
+      useLiveNodeOverrides.getState().clear(movingWindowNode.id)
+      const side = sideOverride ?? 'front'
+      const rotation: [number, number, number] = [0, side === 'back' ? Math.PI : 0, 0]
+      let placedId: string
+
+      if (isNew) {
+        useScene.getState().deleteNode(movingWindowNode.id)
+        const cloned = structuredClone(movingWindowNode) as any
+        delete cloned.id
+        cloned.metadata = stripPlacementMetadataFlags(cloned.metadata)
+        const committedNode = WindowNode.parse({
+          ...cloned,
+          position: target.position,
+          rotation,
+          side,
+          parentId: target.dormer.id,
+          dormerId: target.dormer.id,
+          dormerFace: target.face,
+          wallId: undefined,
+          roofSegmentId: undefined,
+          roofFace: undefined,
+          visible: true,
+        })
+        history.commitStep(() => {
+          useScene.getState().createNode(committedNode, target.dormer.id as AnyNodeId)
+        })
+        placedId = committedNode.id
+      } else {
+        useScene.getState().updateNode(movingWindowNode.id, {
+          position: original.position,
+          rotation: original.rotation,
+          side: original.side,
+          parentId: original.parentId,
+          wallId: original.wallId,
+          dormerId: original.dormerId,
+          dormerFace: original.dormerFace,
+          roofSegmentId: original.roofSegmentId,
+          roofFace: original.roofFace,
+          metadata: original.metadata,
+          visible: original.visible,
+        })
+        history.commitStep(() => {
+          useScene.getState().updateNode(movingWindowNode.id, {
+            position: target.position,
+            rotation,
+            side,
+            parentId: target.dormer.id,
+            dormerId: target.dormer.id,
+            dormerFace: target.face,
+            wallId: undefined,
+            roofSegmentId: undefined,
+            roofFace: undefined,
+            metadata: {},
+            visible: true,
+          })
+        })
+        if (original.parentId && original.parentId !== target.dormer.id) {
+          markHostDirty(original.parentId)
+        }
+        placedId = movingWindowNode.id
+      }
+
+      markHostDirty(target.dormer.id)
+      useLiveTransforms.getState().clear(movingWindowNode.id)
+      triggerSFX('sfx:structure-build')
+      hideCursor()
+      selectNode(placedId as AnyNodeId)
+      exitMoveMode()
+      event.stopPropagation()
+    }
+
+    const onDormerHover = (event: DormerEvent) => {
+      if (committed) return
+      const target = resolveDormerMoveTarget(event)
+      if (!target) {
+        onDormerLeave()
+        return
+      }
+      applyDormerPreview(event, target)
+      event.stopPropagation()
+    }
+
+    const onDormerClick = (event: DormerEvent) => {
+      if (committed) return
+      const target =
+        lastDormerTarget && lastDormerEvent?.node.id === event.node.id
+          ? lastDormerTarget
+          : resolveDormerMoveTarget(event)
+      if (!target) return
+      if (!target.valid && event.nativeEvent?.altKey !== true) return
+      commitToDormer(event, target)
+    }
+
+    const onDormerLeave = () => {
+      hideCursor()
+      useLiveNodeOverrides.getState().clear(movingWindowNode.id)
+      useLiveTransforms.getState().clear(movingWindowNode.id)
+      lastDormerEvent = null
+      lastDormerTarget = null
+    }
+
+    const dormerEventFromWindow = (event: WindowEvent): DormerEvent | null => {
+      const dormerId = event.node.dormerId ?? event.node.parentId
+      const dormer = dormerId ? useScene.getState().nodes[dormerId as AnyNodeId] : undefined
+      const object = dormer ? sceneRegistry.nodes.get(dormer.id as AnyNodeId) : undefined
+      if (!(dormer?.type === 'dormer' && object)) return null
+      return dormerEventFromHostedWindow(event, dormer, object)
+    }
+
+    const onDormerWindowHover = (event: WindowEvent) => {
+      const dormerEvent = dormerEventFromWindow(event)
+      if (dormerEvent) onDormerHover(dormerEvent)
+    }
+
+    const onDormerWindowClick = (event: WindowEvent) => {
+      const dormerEvent = dormerEventFromWindow(event)
+      if (dormerEvent) onDormerClick(dormerEvent)
+    }
+
+    const onDormerWindowLeave = (event: WindowEvent) => {
+      if (
+        event.node.dormerId ||
+        useScene.getState().nodes[event.node.parentId as AnyNodeId]?.type === 'dormer'
+      ) {
+        onDormerLeave()
+      }
     }
 
     // ── Roof-segment wall faces ─────────────────────────────────────
@@ -748,13 +1019,16 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       grabWallId = null
       lastTarget = null
       lastRoofEvent = event
+      useLiveNodeOverrides.getState().clear(movingWindowNode.id)
       useLiveTransforms.getState().clear(movingWindowNode.id)
       // Opening guides are wall-specific; clear them when over a roof face.
       clearOpeningGuides3D()
       // On a roof face the real mesh is the preview — drop the ghost + reveal.
       revealRealNode()
       if (currentHostId !== target.segment.id) {
-        useScene.getState().updateNode(movingWindowNode.id, {
+        markHostDirty(currentHostId)
+        currentHostId = target.segment.id
+        useLiveNodeOverrides.getState().set(movingWindowNode.id, {
           position: target.position,
           rotation: [0, 0, 0],
           side: 'front',
@@ -764,10 +1038,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
           roofFace: target.face.id,
           visible: true,
         })
-        markHostDirty(currentHostId)
-        currentHostId = target.segment.id
       } else {
-        useScene.getState().updateNode(movingWindowNode.id, {
+        useLiveNodeOverrides.getState().set(movingWindowNode.id, {
           position: target.position,
           rotation: [0, 0, 0],
           roofFace: target.face.id,
@@ -789,8 +1061,9 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       let placedId: string
 
       if (isNew) {
+        // See commitToWall — delete the draft paused, create as the ONE
+        // tracked write.
         useScene.getState().deleteNode(movingWindowNode.id)
-        useScene.temporal.getState().resume()
 
         const cloned = structuredClone(movingWindowNode) as any
         delete cloned.id
@@ -807,32 +1080,39 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
           parentId: segmentId,
           visible: true,
         })
-        useScene.getState().createNode(node, segmentId as AnyNodeId)
+        history.commitStep(() => {
+          useScene.getState().createNode(node, segmentId as AnyNodeId)
+        })
         placedId = node.id
       } else {
+        // See commitToWall — restore the pre-drag baseline paused, drop as
+        // the ONE tracked write.
         useScene.getState().updateNode(movingWindowNode.id, {
           position: original.position,
           rotation: original.rotation,
           side: original.side,
           parentId: original.parentId,
           wallId: original.wallId,
+          dormerId: original.dormerId,
+          dormerFace: original.dormerFace,
           roofSegmentId: original.roofSegmentId,
           roofFace: original.roofFace,
           metadata: original.metadata,
           visible: original.visible,
         })
-        useScene.temporal.getState().resume()
 
-        useScene.getState().updateNode(movingWindowNode.id, {
-          position: target.position,
-          rotation: [0, 0, 0],
-          side: 'front',
-          parentId: segmentId,
-          wallId: undefined,
-          roofSegmentId: segmentId,
-          roofFace: target.face.id,
-          metadata: {},
-          visible: true,
+        history.commitStep(() => {
+          useScene.getState().updateNode(movingWindowNode.id, {
+            position: target.position,
+            rotation: [0, 0, 0],
+            side: 'front',
+            parentId: segmentId,
+            wallId: undefined,
+            roofSegmentId: segmentId,
+            roofFace: target.face.id,
+            metadata: {},
+            visible: true,
+          })
         })
 
         if (original.parentId && original.parentId !== segmentId) {
@@ -843,11 +1123,10 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
 
       markHostDirty(segmentId)
       useLiveTransforms.getState().clear(movingWindowNode.id)
-      useScene.temporal.getState().pause()
 
       triggerSFX('sfx:structure-build')
       hideCursor()
-      useViewer.getState().setSelection({ selectedIds: [placedId] })
+      selectNode(placedId as AnyNodeId)
       exitMoveMode()
       event.stopPropagation()
     }
@@ -856,6 +1135,7 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       // Mirror onWallLeave: don't revert to origin here — onGridMove takes
       // over on the same pointermove (snap to a nearby wall or free-follow).
       hideCursor()
+      useLiveNodeOverrides.getState().clear(movingWindowNode.id)
       useLiveTransforms.getState().clear(movingWindowNode.id)
       dragAnchor = null
       lastTarget = null
@@ -863,6 +1143,7 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
     }
 
     const onCancel = () => {
+      useLiveNodeOverrides.getState().clear(movingWindowNode.id)
       useLiveTransforms.getState().clear(movingWindowNode.id)
       if (isNew) {
         useScene.getState().deleteNode(movingWindowNode.id)
@@ -874,6 +1155,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
           side: original.side,
           parentId: original.parentId,
           wallId: original.wallId,
+          dormerId: original.dormerId,
+          dormerFace: original.dormerFace,
           roofSegmentId: original.roofSegmentId,
           roofFace: original.roofFace,
           metadata: original.metadata,
@@ -881,7 +1164,10 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
         })
         if (original.parentId) markHostDirty(original.parentId)
       }
-      useScene.temporal.getState().resume()
+      // The revert writes above ran under the gesture's history pause (never
+      // tracked); ending the session here keeps a cancelled move out of undo
+      // entirely. `end` is idempotent — the effect cleanup's end() is a no-op.
+      history.end()
       hideCursor()
       exitMoveMode()
     }
@@ -897,6 +1183,7 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
         return
       }
       if (lastRoofEvent) onRoofClick(lastRoofEvent)
+      if (lastDormerEvent && lastDormerTarget) commitToDormer(lastDormerEvent, lastDormerTarget)
     }
 
     // R flips the window's facing side mid-placement (front ↔ back), like the
@@ -926,6 +1213,9 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
           lastTarget = next
           applyPreview(next)
         }
+      } else if (lastDormerEvent) {
+        const next = resolveDormerMoveTarget(lastDormerEvent)
+        if (next) applyDormerPreview(lastDormerEvent, next)
       } else if (lastFloorPoint) {
         // Free-following: re-run at the same spot so the floating ghost rebuilds
         // with the flipped side.
@@ -958,6 +1248,14 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
     emitter.on('roof:move', onRoofHover)
     emitter.on('roof:click', onRoofClick)
     emitter.on('roof:leave', onRoofLeave)
+    emitter.on('dormer:enter', onDormerHover)
+    emitter.on('dormer:move', onDormerHover)
+    emitter.on('dormer:click', onDormerClick)
+    emitter.on('dormer:leave', onDormerLeave)
+    emitter.on('window:enter', onDormerWindowHover)
+    emitter.on('window:move', onDormerWindowHover)
+    emitter.on('window:click', onDormerWindowClick)
+    emitter.on('window:leave', onDormerWindowLeave)
     emitter.on('grid:move', onGridMove)
     emitter.on('tool:cancel', onCancel)
     window.addEventListener('pointerup', onPlacementDragPointerUp)
@@ -1022,6 +1320,8 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
             side: original.side,
             parentId: original.parentId,
             wallId: original.wallId,
+            dormerId: original.dormerId,
+            dormerFace: original.dormerFace,
             roofSegmentId: original.roofSegmentId,
             roofFace: original.roofFace,
             metadata: original.metadata,
@@ -1035,12 +1335,14 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
         // becomes an invisible orphan (place-preset deletes a true cancel).
         useScene.getState().updateNode(movingWindowNode.id, { visible: true })
       }
+      useLiveNodeOverrides.getState().clear(movingWindowNode.id)
       useLiveTransforms.getState().clear(movingWindowNode.id)
       useAlignmentGuides.getState().clear()
       clearOpeningGuides3D()
       useFacingPose.getState().clear()
       clearPlacementSurface()
-      useScene.temporal.getState().resume()
+      releaseHiddenWallHold()
+      history.end()
       emitter.off('wall:enter', onWallEnter)
       emitter.off('wall:move', onWallMove)
       emitter.off('wall:click', onWallClick)
@@ -1049,6 +1351,14 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       emitter.off('roof:move', onRoofHover)
       emitter.off('roof:click', onRoofClick)
       emitter.off('roof:leave', onRoofLeave)
+      emitter.off('dormer:enter', onDormerHover)
+      emitter.off('dormer:move', onDormerHover)
+      emitter.off('dormer:click', onDormerClick)
+      emitter.off('dormer:leave', onDormerLeave)
+      emitter.off('window:enter', onDormerWindowHover)
+      emitter.off('window:move', onDormerWindowHover)
+      emitter.off('window:click', onDormerWindowClick)
+      emitter.off('window:leave', onDormerWindowLeave)
       emitter.off('grid:move', onGridMove)
       emitter.off('tool:cancel', onCancel)
       window.removeEventListener('pointerup', onPlacementDragPointerUp)
@@ -1056,7 +1366,7 @@ const MoveWindowTool: React.FC<{ node: WindowNode }> = ({ node: movingWindowNode
       window.removeEventListener('keydown', onAltToggle)
       window.removeEventListener('keyup', onAltToggle)
     }
-  }, [movingWindowNode, exitMoveMode])
+  }, [activeLevelId, exitMoveMode, isCameraDragging, movingWindowNode, selectNode])
 
   const edgesGeo = useMemo(() => {
     const boxGeo = new BoxGeometry(

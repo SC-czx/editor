@@ -2,6 +2,8 @@
 
 import {
   type AnyNodeId,
+  acquireSceneHistoryPause,
+  constrainWallCurveOffsetToAvoidIntersections,
   emitter,
   type GridEvent,
   getClampedWallCurveOffset,
@@ -9,6 +11,7 @@ import {
   getWallChordFrame,
   getWallMidpointHandlePoint,
   normalizeWallCurveOffset,
+  useLiveNodeOverrides,
   useScene,
   type WallNode,
 } from '@pascal-app/core'
@@ -27,10 +30,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 /**
  * Phase 5 Stage D — wall curve tool (kind-owned).
  *
- * 1:1 port of the legacy `CurveWallTool`. Same snap pipeline,
- * history dance, activation grace. The wall variant uses
- * `useScene.temporal.getState().pause()` / `.resume()` directly rather
- * than the depth-counted `pauseSceneHistory` helpers — matches legacy.
+ * 1:1 port of the legacy `CurveWallTool`. Same snap pipeline and
+ * activation grace. History uses an idempotent lease because cancel and
+ * effect cleanup can both release the active interaction.
  */
 export const CurveWallTool: React.FC<{ node: WallNode }> = ({ node }) => {
   const activatedAtRef = useRef<number>(Date.now())
@@ -56,9 +58,13 @@ export const CurveWallTool: React.FC<{ node: WallNode }> = ({ node }) => {
     const originalCurveOffset = originalCurveOffsetRef.current
     const chord = getWallChordFrame(node)
     const maxCurveOffset = getMaxWallCurveOffset(node)
+    const levelWalls = Object.values(useScene.getState().nodes).filter(
+      (candidate): candidate is WallNode =>
+        candidate.type === 'wall' && candidate.parentId === node.parentId,
+    )
 
-    useScene.temporal.getState().pause()
-    let wasCommitted = false
+    let releaseHistory = acquireSceneHistoryPause(useScene)
+    let wasFinalized = false
 
     const applyPreview = (curveOffset: number) => {
       if (previewOffsetRef.current === curveOffset) {
@@ -72,16 +78,13 @@ export const CurveWallTool: React.FC<{ node: WallNode }> = ({ node }) => {
       }
       const handlePoint = getWallMidpointHandlePoint(nextNode)
       setCursorLocalPos([handlePoint.x, 0, handlePoint.y])
-      useScene.getState().updateNode(nodeId, { curveOffset })
+      useLiveNodeOverrides.getState().set(nodeId as AnyNodeId, { curveOffset })
       useScene.getState().markDirty(nodeId as AnyNodeId)
     }
 
     const restoreOriginal = () => {
-      if (previewOffsetRef.current === originalCurveOffset) {
-        return
-      }
       previewOffsetRef.current = originalCurveOffset
-      useScene.getState().updateNode(nodeId, { curveOffset: originalCurveOffset })
+      useLiveNodeOverrides.getState().clear(nodeId as AnyNodeId)
       useScene.getState().markDirty(nodeId as AnyNodeId)
     }
 
@@ -102,9 +105,14 @@ export const CurveWallTool: React.FC<{ node: WallNode }> = ({ node }) => {
         (localZ - chord.midpoint.y) * chord.normal.y
       )
       const snappedOffset = snapScalarToGrid(offsetFromMidpoint, snapStep)
-      const nextCurveOffset = normalizeWallCurveOffset(
+      const requestedCurveOffset = normalizeWallCurveOffset(
         node,
         Math.max(-maxCurveOffset, Math.min(maxCurveOffset, snappedOffset)),
+      )
+      const nextCurveOffset = constrainWallCurveOffsetToAvoidIntersections(
+        node,
+        requestedCurveOffset,
+        levelWalls,
       )
 
       if (
@@ -119,24 +127,22 @@ export const CurveWallTool: React.FC<{ node: WallNode }> = ({ node }) => {
     }
 
     const onGridClick = (event: GridEvent) => {
+      if (wasFinalized) return
       if (Date.now() - activatedAtRef.current < 150) {
         event.nativeEvent?.stopPropagation?.()
         return
       }
 
       const curveOffset = previewOffsetRef.current
-      wasCommitted = true
+      wasFinalized = true
+      useLiveNodeOverrides.getState().clear(nodeId as AnyNodeId)
+      useScene.getState().markDirty(nodeId as AnyNodeId)
 
       if (curveOffset !== originalCurveOffset) {
-        // Restore original baseline while paused so the next resume+update
-        // registers as a single tracked change (undo reverts to original).
-        useScene.getState().updateNode(nodeId, { curveOffset: originalCurveOffset })
-        useScene.getState().markDirty(nodeId as AnyNodeId)
-
-        useScene.temporal.getState().resume()
+        releaseHistory()
         useScene.getState().updateNode(nodeId, { curveOffset })
         useScene.getState().markDirty(nodeId as AnyNodeId)
-        useScene.temporal.getState().pause()
+        releaseHistory = acquireSceneHistoryPause(useScene)
       }
 
       triggerSFX('sfx:item-place')
@@ -146,9 +152,11 @@ export const CurveWallTool: React.FC<{ node: WallNode }> = ({ node }) => {
     }
 
     const onCancel = () => {
+      if (wasFinalized) return
       restoreOriginal()
+      wasFinalized = true
       useViewer.getState().setSelection({ selectedIds: [nodeId] })
-      useScene.temporal.getState().resume()
+      releaseHistory()
       markToolCancelConsumed()
       exitCurveMode()
     }
@@ -158,10 +166,10 @@ export const CurveWallTool: React.FC<{ node: WallNode }> = ({ node }) => {
     emitter.on('tool:cancel', onCancel)
 
     return () => {
-      if (!wasCommitted) {
+      if (!wasFinalized) {
         restoreOriginal()
       }
-      useScene.temporal.getState().resume()
+      releaseHistory()
       emitter.off('grid:move', onGridMove)
       emitter.off('grid:click', onGridClick)
       emitter.off('tool:cancel', onCancel)

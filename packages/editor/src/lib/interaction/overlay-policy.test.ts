@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import type { AnyNode } from '@pascal-app/core'
-import { resolveOverlayPolicy } from './overlay-policy'
+import {
+  resolveFloatingActionMenuVisibility,
+  resolveOverlayPolicy,
+  shouldShowEditingControls,
+} from './overlay-policy'
 import type { ActiveInteractionScope } from './scope'
 
 const mockNode = (id: string, type: string): AnyNode => ({ id, type }) as unknown as AnyNode
@@ -13,6 +17,7 @@ const ACTIVE_SCOPES: ActiveInteractionScope[] = [
     nodeType: 'item',
     view: '3d',
     pressDrag: false,
+    driver: 'move-tool',
   },
   { kind: 'moving', node: mockNode('i1', 'item'), nodeId: 'i1', nodeType: 'item', view: '2d' },
   { kind: 'handle-drag', nodeId: 'w1', handle: 'height' },
@@ -48,5 +53,32 @@ describe('resolveOverlayPolicy', () => {
       expect(p.activeAffordances).toBe('shown')
       expect(p.contextualHudInteractive).toBe(true)
     }
+  })
+})
+
+describe('shouldShowEditingControls', () => {
+  test('hides controls that can mutate a read-only scene', () => {
+    expect(shouldShowEditingControls(false)).toBe(true)
+    expect(shouldShowEditingControls(true)).toBe(false)
+  })
+})
+
+describe('resolveFloatingActionMenuVisibility', () => {
+  test('keeps the active measurement pill while hiding action buttons during a height drag', () => {
+    const visibility = resolveFloatingActionMenuVisibility(
+      { kind: 'handle-drag', nodeId: 'wall_1', handle: 'height' },
+      true,
+    )
+
+    expect(visibility).toEqual({ root: true, actions: false })
+  })
+
+  test('hides the whole menu during interactions without an active measurement pill', () => {
+    const visibility = resolveFloatingActionMenuVisibility(
+      { kind: 'handle-drag', nodeId: 'wall_1', handle: 'elevation' },
+      false,
+    )
+
+    expect(visibility).toEqual({ root: false, actions: false })
   })
 })

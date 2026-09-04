@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "dotenv -e ../../.env.local -- next dev --port ${PORT:-3002}",
+    "dev": "dotenv -e ../../.env.local -e ../../.env.defaults -- next dev",
     "build": "dotenv -e ../../.env.local -- next build",
     "start": "next start",
     "lint": "biome lint",
@@ -13,11 +13,14 @@
   },
   "dependencies": {
     "@iconify/react": "^6.0.2",
+    "@pascal-app/plugin-bones": "github:pascalorg/plugin-bones#5679260261ee1c733656ff6dfb99e30bb24b58a7",
+    "@mint/pascal-plugin": "github:mintdotgg/mint-pascal-plugin#902c546dbaece6b31455c0dc394afe6b9cd136fe",
     "@number-flow/react": "^0.6.0",
     "@pascal-app/core": "*",
     "@pascal-app/editor": "*",
     "@pascal-app/mcp": "*",
     "@pascal-app/nodes": "*",
+    "@pascal-app/plugin-streetscape": "github:sudhir9297/streetscape-pascal-plugin#1c04ec9ccb3fa8124ec56dfc1026567cbbc51aef",
     "@pascal-app/plugin-trees": "github:pascalorg/plugin-trees#56d978cd9b409b716207b3f3d269455d3cd6f067",
     "@pascal-app/viewer": "*",
     "@radix-ui/react-tooltip": "^1.2.8",
@@ -34,7 +37,7 @@
     "tailwind-merge": "^3.5.0",
     "tailwindcss": "^4.2.1",
     "three": "^0.185.0",
-    "zod": "^4.3.5"
+    "zod": ">=4.5.4 <4.6"
   },
   "devDependencies": {
     "@pascal/typescript-config": "*",

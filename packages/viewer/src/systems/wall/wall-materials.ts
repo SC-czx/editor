@@ -24,6 +24,7 @@ import {
   createMaterial,
   createMaterialFromPresetRef,
   createSurfaceRoleMaterial,
+  materialPresetRefSignature,
   type RenderShading,
   resolveMaterialRef,
   resolveSurfaceColor,
@@ -153,8 +154,10 @@ function resolveWallSlotMaterial(
 
 // Cache-key fragment for one face: the slot ref plus, for a `scene:` ref, the
 // referenced material's *content* — so editing a scene material assigned to a
-// wall invalidates the cache (a `library:` ref is static catalog content, so
-// its id alone is enough). Falls back to the legacy signature when unmigrated.
+// wall invalidates the cache. A `library:` ref carries its resolution state
+// instead: AI-generated materials register asynchronously, and a dangling ref
+// resolved to the slot default must not stay cached once the library lands.
+// Falls back to the legacy signature when unmigrated.
 function wallFaceMaterialSignature(
   wallNode: WallNode,
   side: WallSurfaceSide,
@@ -169,7 +172,7 @@ function wallFaceMaterialSignature(
         material: sceneMaterials?.[parsed.id as SceneMaterialId]?.material ?? null,
       })
     }
-    return JSON.stringify({ ref })
+    return JSON.stringify({ ref: materialPresetRefSignature(ref) })
   }
   return getWallSurfaceMaterialSignature(getEffectiveWallSurfaceMaterial(wallNode, side))
 }
@@ -188,7 +191,7 @@ function wallSlotMaterialSignature(
         material: sceneMaterials?.[parsed.id as SceneMaterialId]?.material ?? null,
       })
     }
-    return JSON.stringify({ ref })
+    return JSON.stringify({ ref: materialPresetRefSignature(ref) })
   }
 
   const side = getWallSurfaceSideFromBandSlot(slotId)
@@ -299,6 +302,14 @@ const SELECTION_HIGHLIGHT_COLOR = new Color('#818cf8')
 const SELECTION_EMISSIVE_BLEND = 0.4
 const SELECTION_EMISSIVE_INTENSITY = 0.12
 
+// Softer sibling of the selection glow, for HOVERING a hidden wall (the
+// X-ray nearest-first selection made hidden walls hover targets; without a
+// material affordance the only thing lighting up was the furniture behind
+// them). Same indigo so hover reads as "this will select", weaker so a
+// hovered-then-selected wall still steps up on click.
+const HOVER_EMISSIVE_BLEND = 0.4
+const HOVER_EMISSIVE_INTENSITY = 0.2
+
 const SELECTION_TEXTURE_MAP_KEYS = [
   'map',
   'normalMap',
@@ -313,10 +324,16 @@ const SELECTION_TEXTURE_MAP_KEYS = [
 ] as const
 
 const selectionHighlightCache = new WeakMap<Material, { clone: Material; map: unknown }>()
+const hoverHighlightCache = new WeakMap<Material, { clone: Material; map: unknown }>()
 
-function getSelectionHighlightMaterial(base: Material): Material {
+function getEmissiveHighlightMaterial(
+  base: Material,
+  cache: WeakMap<Material, { clone: Material; map: unknown }>,
+  emissiveBlend: number,
+  emissiveIntensity: number,
+): Material {
   const baseMap = (base as { map?: unknown }).map ?? null
-  const cached = selectionHighlightCache.get(base)
+  const cached = cache.get(base)
   if (cached && cached.map === baseMap) return cached.clone
 
   const clone = base.clone() as Material & {
@@ -331,21 +348,42 @@ function getSelectionHighlightMaterial(base: Material): Material {
     if (src[key]) dst[key] = src[key]
   }
   if ('emissive' in clone && clone.emissive) {
-    clone.emissive = clone.emissive
-      .clone()
-      .lerp(SELECTION_HIGHLIGHT_COLOR, SELECTION_EMISSIVE_BLEND)
+    clone.emissive = clone.emissive.clone().lerp(SELECTION_HIGHLIGHT_COLOR, emissiveBlend)
   }
   if ('emissiveIntensity' in clone) {
-    clone.emissiveIntensity = Math.max(clone.emissiveIntensity ?? 0, SELECTION_EMISSIVE_INTENSITY)
+    clone.emissiveIntensity = Math.max(clone.emissiveIntensity ?? 0, emissiveIntensity)
   }
   clone.needsUpdate = true
-  selectionHighlightCache.set(base, { clone, map: baseMap })
+  cache.set(base, { clone, map: baseMap })
   return clone
 }
 
 /** Lazy light-emissive selection variant of a wall's material array (keeps texture). */
 export function getSelectionHighlightMaterials(materials: WallMaterialArray): WallMaterialArray {
-  return materials.map(getSelectionHighlightMaterial) as WallMaterialArray
+  return materials.map((material) =>
+    getEmissiveHighlightMaterial(
+      material,
+      selectionHighlightCache,
+      SELECTION_EMISSIVE_BLEND,
+      SELECTION_EMISSIVE_INTENSITY,
+    ),
+  ) as WallMaterialArray
+}
+
+/**
+ * Softer hover sibling of the selection variant — the affordance for a
+ * hovered HIDDEN wall (`WallCutout` applies it to the invisible stipple
+ * film so the wall the click would select reads under the cursor).
+ */
+export function getHoverHighlightMaterials(materials: WallMaterialArray): WallMaterialArray {
+  return materials.map((material) =>
+    getEmissiveHighlightMaterial(
+      material,
+      hoverHighlightCache,
+      HOVER_EMISSIVE_BLEND,
+      HOVER_EMISSIVE_INTENSITY,
+    ),
+  ) as WallMaterialArray
 }
 
 function createInvisibleWallMaterial(color: string, shading: RenderShading): Material {

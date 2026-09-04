@@ -1,11 +1,15 @@
 import { describe, expect, test } from 'bun:test'
-import { getRoofSegmentSurfaceY, type RoofSegmentNode } from '@pascal-app/core'
-import { getDormerExposedFaces } from '../csg-geometry'
 import {
-  buildDormerGhostGeometry,
-  dormerSupportsArch,
-  dormerSupportsCornerRadii,
-} from '../geometry'
+  getDormerDefaultWindowFace,
+  getDormerExposedFaces,
+  getRoofSegmentSurfaceY,
+  type RoofSegmentNode,
+  type RoofType,
+  WindowNode,
+} from '@pascal-app/core'
+import { DoubleSide, Mesh, MeshBasicMaterial, Raycaster, Vector3 } from 'three'
+import { buildDormerRoofCut, generateDormerGeometry } from '../csg-geometry'
+import { buildDormerGhostGeometry } from '../geometry'
 import { DormerNode } from '../schema'
 
 describe('buildDormerGhostGeometry (placement preview)', () => {
@@ -29,18 +33,179 @@ describe('buildDormerGhostGeometry (placement preview)', () => {
     b.computeBoundingBox()
     expect(b.boundingBox!.max.y).toBeGreaterThan(a.boundingBox!.max.y)
   })
+
+  test('shedHighSide flips the shed pitch direction', () => {
+    const backHigh = buildDormerGhostGeometry(
+      DormerNode.parse({
+        roofType: 'shed',
+        shedHighSide: 'back',
+        width: 4,
+        depth: 3,
+        height: 1,
+        roofHeight: 1.2,
+      }),
+    )
+    const frontHigh = buildDormerGhostGeometry(
+      DormerNode.parse({
+        roofType: 'shed',
+        shedHighSide: 'front',
+        width: 4,
+        depth: 3,
+        height: 1,
+        roofHeight: 1.2,
+      }),
+    )
+
+    const edgeMaxY = (geometry: typeof backHigh, z: number) => {
+      const position = geometry.getAttribute('position')
+      let maxY = -Infinity
+      for (let index = 0; index < position.count; index++) {
+        if (Math.abs(position.getZ(index) - z) < 0.001) {
+          maxY = Math.max(maxY, position.getY(index))
+        }
+      }
+      return maxY
+    }
+
+    expect(edgeMaxY(backHigh, -1.5)).toBeGreaterThan(edgeMaxY(backHigh, 1.5))
+    expect(edgeMaxY(frontHigh, 1.5)).toBeGreaterThan(edgeMaxY(frontHigh, -1.5))
+
+    backHigh.dispose()
+    frontHigh.dispose()
+  })
+
+  test.each([
+    ['flat', 1],
+    ['gable', 2],
+    ['hip', 2],
+    ['shed', 2],
+    ['gambrel', 3],
+    ['mansard', 3],
+    ['dutch', 4],
+  ] satisfies [
+    RoofType,
+    number,
+  ][])('builds the canonical %s height profile', (roofType, levels) => {
+    const wallHeight = 1
+    const geo = buildDormerGhostGeometry(
+      DormerNode.parse({ roofType, width: 4, depth: 3, height: wallHeight, roofHeight: 1.2 }),
+    )
+    const position = geo.getAttribute('position')
+    const roofLevels = new Set<number>()
+    for (let index = 0; index < position.count; index++) {
+      const y = position.getY(index)
+      if (y >= wallHeight - 0.001) roofLevels.add(Math.round(y * 1000))
+    }
+
+    expect(roofLevels.size).toBe(levels)
+  })
+
+  test('assigns roof faces to the roof material slot', () => {
+    const geo = buildDormerGhostGeometry(DormerNode.parse({ roofType: 'mansard' }))
+
+    expect(geo.groups.some((group) => group.materialIndex === 0)).toBe(true)
+    expect(geo.groups.some((group) => group.materialIndex === 3)).toBe(true)
+  })
 })
 
-describe('windowShape predicates', () => {
-  test('dormerSupportsArch only when windowShape=arch', () => {
-    expect(dormerSupportsArch(DormerNode.parse({ windowShape: 'arch' }))).toBe(true)
-    expect(dormerSupportsArch(DormerNode.parse({ windowShape: 'rounded' }))).toBe(false)
-    expect(dormerSupportsArch(DormerNode.parse({ windowShape: 'rectangle' }))).toBe(false)
+describe('buildDormerRoofCut', () => {
+  test('keeps the committed shed cut aligned with the configured high side', () => {
+    const makeCut = (shedHighSide: 'back' | 'front') =>
+      buildDormerRoofCut(
+        DormerNode.parse({
+          roofType: 'shed',
+          shedHighSide,
+          width: 4,
+          depth: 3,
+          height: 1,
+          roofHeight: 1.2,
+        }),
+      )!
+    const backHigh = makeCut('back')
+    const frontHigh = makeCut('front')
+    const edgeMaxY = (geometry: typeof backHigh, z: number) => {
+      const position = geometry.getAttribute('position')
+      let maxY = -Infinity
+      for (let index = 0; index < position.count; index++) {
+        if (Math.abs(position.getZ(index) - z) < 0.001) {
+          maxY = Math.max(maxY, position.getY(index))
+        }
+      }
+      return maxY
+    }
+
+    expect(edgeMaxY(backHigh, -1.45)).toBeGreaterThan(edgeMaxY(backHigh, 1.45))
+    expect(edgeMaxY(frontHigh, 1.45)).toBeGreaterThan(edgeMaxY(frontHigh, -1.45))
+
+    backHigh.dispose()
+    frontHigh.dispose()
   })
-  test('dormerSupportsCornerRadii only when windowShape=rounded', () => {
-    expect(dormerSupportsCornerRadii(DormerNode.parse({ windowShape: 'rounded' }))).toBe(true)
-    expect(dormerSupportsCornerRadii(DormerNode.parse({ windowShape: 'arch' }))).toBe(false)
-    expect(dormerSupportsCornerRadii(DormerNode.parse({ windowShape: 'rectangle' }))).toBe(false)
+})
+
+describe('hosted window cuts', () => {
+  test('cuts the same off-center point on the right face where the hosted window renders', () => {
+    const dormer = DormerNode.parse({
+      depth: 3,
+      height: 1,
+      id: 'dormer_test',
+      position: [0, 10, 0],
+      roofHeight: 1,
+      roofType: 'gable',
+      wallSkirtHeight: 2,
+      width: 4,
+    })
+    const window = WindowNode.parse({
+      dormerFace: 'right',
+      dormerId: dormer.id,
+      height: 1,
+      id: 'window_test',
+      parentId: dormer.id,
+      position: [0.5, -0.5, 0],
+      width: 1,
+    })
+    const geometry = generateDormerGeometry(dormer, hostSegment(), [window])
+    const material = new MeshBasicMaterial({ side: DoubleSide })
+    const mesh = new Mesh(geometry, material)
+    const raycaster = new Raycaster(new Vector3(10, -0.5, -0.5), new Vector3(-1, 0, 0))
+
+    const firstHit = raycaster.intersectObject(mesh)[0]
+
+    expect(firstHit?.point.x).toBeLessThan(0)
+    geometry.dispose()
+    material.dispose()
+  })
+
+  test('cuts a hosted window through the upper slope of a shed side wall', () => {
+    const dormer = DormerNode.parse({
+      depth: 4,
+      height: 1,
+      id: 'dormer_test',
+      position: [0, 10, 0],
+      roofHeight: 2,
+      roofType: 'shed',
+      shedHighSide: 'back',
+      wallSkirtHeight: 2,
+      width: 4,
+    })
+    const window = WindowNode.parse({
+      dormerFace: 'right',
+      dormerId: dormer.id,
+      height: 1,
+      id: 'window_test',
+      parentId: dormer.id,
+      position: [1, 1.5, 0],
+      width: 1,
+    })
+    const geometry = generateDormerGeometry(dormer, hostSegment(), [window])
+    const material = new MeshBasicMaterial({ side: DoubleSide })
+    const mesh = new Mesh(geometry, material)
+    const raycaster = new Raycaster(new Vector3(10, 1.5, -1), new Vector3(-1, 0, 0))
+
+    const firstHit = raycaster.intersectObject(mesh)[0]
+
+    expect(firstHit?.point.x).toBeLessThan(0)
+    geometry.dispose()
+    material.dispose()
   })
 })
 
@@ -112,5 +277,15 @@ describe('getDormerExposedFaces', () => {
       front: false,
       back: true,
     })
+  })
+
+  test('uses the exposed back face for the automatic hosted window', () => {
+    const seg = hostSegment()
+    expect(getDormerDefaultWindowFace(dormerAt(seg, 0, -1.5), seg)).toBe('back')
+  })
+
+  test('prefers the front face when both or neither face clears the host', () => {
+    const seg = hostSegment({ pitch: 10 })
+    expect(getDormerDefaultWindowFace(dormerAt(seg, 0, 1.5), seg)).toBe('front')
   })
 })

@@ -33,6 +33,7 @@ import {
   type RoofNode,
   type RoofSegmentNode,
   resolveSlabPlacementElevation,
+  resolveTerrainWallConstructionOptions,
   type SiteNode,
   type SlabNode,
   SlabNode as SlabNodeSchema,
@@ -88,6 +89,7 @@ import {
   type FloorplanNodeTransform as SharedFloorplanNodeTransform,
   worldToFloorplanLocalPoint,
 } from '../../lib/floorplan'
+import { resolveGenericFloorplanGridEventPoint } from '../../lib/floorplan-grid-event-point'
 import { groundHeightAt } from '../../lib/ground-surface'
 import { guideEmitter } from '../../lib/guide-events'
 import { measurementHint, parseMeasurement } from '../../lib/measurement-parser'
@@ -184,7 +186,6 @@ import {
   chainEndJoinsExistingWall,
   createWallOnCurrentLevel,
   isSegmentLongEnough,
-  resolveTerrainWallConstructionOptions,
   snapWallDraftPoint,
   snapWallDraftPointDetailed,
   snapPointToGrid as snapWallPointToGrid,
@@ -194,7 +195,7 @@ import {
 } from '../tools/wall/wall-drafting'
 
 import { PALETTE_COLORS } from '../ui/primitives/color-dot'
-import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/primitives/tooltip'
+import { FloorplanCompassButton } from '../viewer/floorplan-compass-button'
 import { resolveFloorplanBackgroundSelection } from './floorplan-background-selection'
 import {
   subscribeFloorplanCameraNavigation,
@@ -504,50 +505,6 @@ type GuideHandleHintAnchor = {
   y: number
   directionX: number
   directionY: number
-}
-
-function FloorplanCompassButton({
-  northRotationDeg,
-  onAlignNorth,
-  needleRef,
-}: {
-  northRotationDeg: number
-  onAlignNorth: () => void
-  needleRef?: React.RefObject<SVGSVGElement | null>
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          aria-label="Align view to north"
-          className="group absolute bottom-3 left-3 z-30 flex h-8 w-8 items-center justify-center rounded-full border border-black/10 bg-white/85 shadow-sm backdrop-blur-md transition hover:bg-white hover:shadow-md dark:border-white/10 dark:bg-neutral-900/85 dark:hover:bg-neutral-900"
-          onClick={(event) => {
-            event.preventDefault()
-            event.stopPropagation()
-            onAlignNorth()
-          }}
-          onPointerDown={(event) => {
-            event.stopPropagation()
-          }}
-          type="button"
-        >
-          <span className="relative flex h-6 w-6 items-center justify-center rounded-full bg-[#b8b8b8] shadow-inner dark:bg-neutral-700">
-            <svg
-              aria-hidden="true"
-              className="h-6 w-6"
-              ref={needleRef}
-              style={{ transform: `rotate(${northRotationDeg}deg)` }}
-              viewBox="0 0 48 48"
-            >
-              <path d="M24 4.5 31.5 25 24 21.5 16.5 25Z" fill="#f15b5b" />
-              <path d="M24 43.5 16.5 23 24 26.5 31.5 23Z" fill="#ffffff" />
-            </svg>
-          </span>
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="right">Align view to north</TooltipContent>
-    </Tooltip>
-  )
 }
 
 type GuideInteractionState = {
@@ -4717,6 +4674,7 @@ function FloorplanLinearDraftLayer({
   const wallDraftEnd = useFloorplanDraftPreview((s) => s.wallDraftEnd)
   const fenceDraftEnd = useFloorplanDraftPreview((s) => s.fenceDraftEnd)
   const roofDraftEnd = useFloorplanDraftPreview((s) => s.roofDraftEnd)
+  const roofDraftQuarterTurn = useFloorplanDraftPreview((s) => s.roofDraftQuarterTurn)
 
   const draftPolygon = useMemo(() => {
     if (
@@ -4752,6 +4710,21 @@ function FloorplanLinearDraftLayer({
     }
     return draftPolygon ? formatPolygonPoints(draftPolygon) : null
   }, [draftPolygon, isRoofBuildActive, roofDraftEnd, roofDraftStart])
+
+  const roofDraftDirectionLine = useMemo(() => {
+    if (!(isRoofBuildActive && roofDraftStart && roofDraftEnd)) return null
+    const minX = Math.min(roofDraftStart[0], roofDraftEnd[0])
+    const maxX = Math.max(roofDraftStart[0], roofDraftEnd[0])
+    const minY = Math.min(roofDraftStart[1], roofDraftEnd[1])
+    const maxY = Math.max(roofDraftStart[1], roofDraftEnd[1])
+    if (maxX - minX < 1e-6 || maxY - minY < 1e-6) return null
+
+    const centerX = (minX + maxX) / 2
+    const centerY = (minY + maxY) / 2
+    return roofDraftQuarterTurn
+      ? { x1: centerX, y1: minY, x2: centerX, y2: maxY }
+      : { x1: minX, y1: centerY, x2: maxX, y2: centerY }
+  }, [isRoofBuildActive, roofDraftEnd, roofDraftQuarterTurn, roofDraftStart])
 
   const fenceDraftSegment = useMemo(() => {
     if (!(isFenceBuildActive && fenceDraftStart && fenceDraftEnd)) {
@@ -4931,6 +4904,19 @@ function FloorplanLinearDraftLayer({
         unitsPerPixel={unitsPerPixel}
       />
 
+      {roofDraftDirectionLine && (
+        <line
+          pointerEvents="none"
+          stroke={draftStroke}
+          strokeLinecap="round"
+          strokeWidth={unitsPerPixel * 1.5}
+          x1={toSvgX(roofDraftDirectionLine.x1)}
+          x2={toSvgX(roofDraftDirectionLine.x2)}
+          y1={toSvgY(roofDraftDirectionLine.y1)}
+          y2={toSvgY(roofDraftDirectionLine.y2)}
+        />
+      )}
+
       {draftWallMeasurement && (
         <FloorplanDraftWallMeasurement
           labelBackground={isDark ? '#0f172a' : '#ffffff'}
@@ -5107,6 +5093,9 @@ export function FloorplanPanel({
     if (building?.type !== 'building') return false
     return building.children.some((cid) => state.nodes[cid]?.type === 'level')
   })
+  // The studio workspace (renders / materials / item builder) is a clean
+  // stage — editor viewport chrome, compass included, stays out of it.
+  const isStudioWorkspace = useEditor((s) => s.workspaceMode === 'studio')
   const elevators = useScene(
     useShallow((state) => {
       const building = currentBuildingId ? state.nodes[currentBuildingId] : null
@@ -9444,10 +9433,14 @@ export function FloorplanPanel({
       // this exclusion the catch-all would emit `grid:move` and re-drive the
       // 3D MoveDoorTool's free-follow, fighting the overlay again.
       if (!isWallBuildActive && !isOpeningMoveActive && isFloorplanGridInteractionActive) {
-        const snappedPoint = getSnappedFloorplanPoint(planPoint)
-        emitFloorplanGridEvent('move', snappedPoint, event)
+        const eventPoint = resolveGenericFloorplanGridEventPoint({
+          point: planPoint,
+          registryToolOwnsSnapping: isRegistryToolBuildActive,
+          snap: getSnappedFloorplanPoint,
+        })
+        emitFloorplanGridEvent('move', eventPoint, event)
         setCursorPoint((previousPoint) =>
-          previousPoint && pointsEqual(previousPoint, snappedPoint) ? previousPoint : snappedPoint,
+          previousPoint && pointsEqual(previousPoint, eventPoint) ? previousPoint : eventPoint,
         )
         return
       }
@@ -9547,6 +9540,7 @@ export function FloorplanPanel({
       // stale closure and float a door symbol while the window tool is armed.
       showOpeningGhost,
       isPolygonBuildActive,
+      isRegistryToolBuildActive,
       isRoofBuildActive,
       isWallBuildActive,
       levelId,
@@ -9893,6 +9887,7 @@ export function FloorplanPanel({
     isOpeningPlacementActive: isOpeningBuildActive && !isOpeningMoveActive,
     isPolygonBuildActive,
     isRoofBuildActive,
+    registryToolOwnsSnapping: isRegistryToolBuildActive,
     isWallBuildActive,
     isZoneBuildActive,
     levelId,
@@ -10556,9 +10551,11 @@ export function FloorplanPanel({
       }
 
       if (useEditor.getState().phase !== 'site') {
-        useEditor.setState({ catalogCategory: null, mode: 'select', phase: 'site', tool: null })
+        useEditor.getState().setPhase('site')
+        useEditor.getState().armToolMode({ mode: 'select' })
+      } else {
+        selectSiteFloorplanContext()
       }
-      selectSiteFloorplanContext()
 
       const nextDraft = {
         siteId,
@@ -10640,9 +10637,11 @@ export function FloorplanPanel({
       ]
 
       if (useEditor.getState().phase !== 'site') {
-        useEditor.setState({ catalogCategory: null, mode: 'select', phase: 'site', tool: null })
+        useEditor.getState().setPhase('site')
+        useEditor.getState().armToolMode({ mode: 'select' })
+      } else {
+        selectSiteFloorplanContext()
       }
-      selectSiteFloorplanContext()
 
       const nextDraft = {
         siteId,
@@ -11151,7 +11150,8 @@ export function FloorplanPanel({
         <FloorplanRegistryActionMenu />
         <FloorplanGroupActionMenu />
 
-        {(levelNode?.type === 'level' || hasAmbientBuildingLevel) &&
+        {!isStudioWorkspace &&
+          (levelNode?.type === 'level' || hasAmbientBuildingLevel) &&
           (compassHost ? (
             createPortal(
               <FloorplanCompassButton

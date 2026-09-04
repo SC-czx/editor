@@ -4,8 +4,7 @@ import type { Object3D } from 'three'
 import { lerp } from 'three/src/math/MathUtils.js'
 import { applyShadowOnly, clearShadowOnly } from '../../lib/shadow-only'
 import useViewer from '../../store/use-viewer'
-
-const EXPLODED_GAP = 5
+import { EXPLODED_GAP } from './level-utils'
 
 // Levels currently in shadow-caster-only mode (solo hides them from the color
 // passes but keeps their sun shadows). Tracked so we can restore layer masks
@@ -47,7 +46,13 @@ export const LevelSystem = () => {
       const explodedExtra = levelMode === 'exploded' ? index * EXPLODED_GAP : 0
       const targetY = baseY + explodedExtra
 
-      obj.position.y = lerp(obj.position.y, targetY, delta * 12) // Smoothly animate to new Y position
+      // Clamped smoothing. The naive `lerp(y, target, delta*12)` multiplies
+      // the error by |1 - 12*delta| per frame — DIVERGENT once a frame
+      // exceeds ~166 ms (slow machines, headless GL, heavy scenes): levels
+      // oscillated kilometers off-screen and the level-fit camera followed
+      // (blank viewport). Clamping keeps every step a contraction: identical
+      // feel at 60 fps, exact snap instead of overshoot on slow frames.
+      obj.position.y = lerp(obj.position.y, targetY, Math.min(1, delta * 12))
 
       // Solo: hidden levels ABOVE the soloed one stay in the shadow map
       // (shadow-caster-only) so the sun still shadows the soloed floor through

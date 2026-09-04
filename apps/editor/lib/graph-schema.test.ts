@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { CabinetModuleNode, CabinetNode } from '@pascal-app/core/schema'
 import { apiGraphSchema } from './graph-schema'
 
 function buildGraph(nodes: Record<string, unknown>, rootNodeIds: string[] = []) {
@@ -37,6 +38,28 @@ test('accepts a builtin container whose children include a plugin node id', () =
   const graph = buildGraph({ [LEVEL_ID]: level([TREE_ID]), [TREE_ID]: pluginTree() }, [LEVEL_ID])
 
   expect(apiGraphSchema.safeParse(graph).success).toBe(true)
+})
+
+test('accepts a cabinet run containing a derived L-corner run', () => {
+  const source = CabinetNode.parse({
+    id: 'cabinet_graph-source',
+    children: ['cabinet_graph-derived'],
+  })
+  const derived = CabinetNode.parse({
+    id: 'cabinet_graph-derived',
+    parentId: source.id,
+    children: ['cabinet-module_graph-derived'],
+  })
+  const module = CabinetModuleNode.parse({
+    id: 'cabinet-module_graph-derived',
+    parentId: derived.id,
+  })
+
+  expect(
+    apiGraphSchema.safeParse(
+      buildGraph({ [source.id]: source, [derived.id]: derived, [module.id]: module }, [source.id]),
+    ).success,
+  ).toBe(true)
 })
 
 test('keeps plugin child ids in the parsed graph', () => {
@@ -164,4 +187,53 @@ test('treats an unnamespaced unknown type as a foreign node', () => {
     apiGraphSchema.safeParse(buildGraph({ [couch.id]: { ...couch, src: 'javascript:alert(1)' } }))
       .success,
   ).toBe(false)
+})
+
+const MATERIAL_ID = 'mat_a1b2c3d4e5f6g7h8'
+const material = (overrides: Record<string, unknown> = {}) => ({
+  id: MATERIAL_ID,
+  name: 'Oak',
+  material: { preset: 'wood', ...overrides },
+})
+
+test('keeps materials in the parsed output', () => {
+  const graph = { ...buildGraph({}), materials: { [MATERIAL_ID]: material() } }
+  const res = apiGraphSchema.safeParse(graph)
+
+  expect(res.success).toBe(true)
+  expect(res.data?.materials).toEqual(graph.materials)
+})
+
+// A material's texture is a URL the editor loads, so it is held to the same
+// `AssetUrl` allowlist as every other URL-shaped field in the graph.
+test('rejects a material texture URL outside the allowlist', () => {
+  for (const url of ['ftp://host/a.png', 'javascript:alert(1)']) {
+    const graph = {
+      ...buildGraph({}),
+      materials: { [MATERIAL_ID]: material({ texture: { url } }) },
+    }
+    expect(apiGraphSchema.safeParse(graph).success).toBe(false)
+  }
+})
+
+test('accepts a material texture URL inside the allowlist', () => {
+  const graph = {
+    ...buildGraph({}),
+    materials: {
+      [MATERIAL_ID]: material({ texture: { url: 'https://cdn.example.com/oak.png' } }),
+    },
+  }
+
+  expect(apiGraphSchema.safeParse(graph).success).toBe(true)
+})
+
+// The routes persist this schema's output, so validation must not double as
+// normalization: a save has to store the palette it was handed.
+test('does not rewrite materials it accepts', () => {
+  const sparse = { id: MATERIAL_ID, name: 'Oak', material: { properties: { color: '#886644' } } }
+  const graph = { ...buildGraph({}), materials: { [MATERIAL_ID]: sparse } }
+  const res = apiGraphSchema.safeParse(graph)
+
+  expect(res.success).toBe(true)
+  expect(res.data?.materials?.[MATERIAL_ID]).toEqual(sparse)
 })

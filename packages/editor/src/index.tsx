@@ -56,6 +56,7 @@ export {
   formatMeasurement,
   MeasurementPill,
 } from './components/editor/measurement-pill'
+export { NodeActionMenu } from './components/editor/node-action-menu'
 // In-world arrow handle primitives (chevron geometry, invisible hit area,
 // shared material, palette + scale constants). Re-exported so kind-owned
 // 3D selection affordances in `@pascal-app/nodes` (duct side-move / height /
@@ -98,6 +99,11 @@ export {
   buildSvgArrowHeadPoints,
   getArcPlanPoint,
 } from './components/editor-2d/svg-paths'
+export type {
+  SelectionAffordanceHistoryApi,
+  SelectionAffordanceInteractionApi,
+  SelectionAffordanceProps,
+} from './components/systems/selection-affordance-services'
 // Phase 5 Stage D transitional exports — pure drafting / angle helpers
 // consumed by kind-owned drag actions in @pascal-app/nodes. Stage F
 // cleanup moves these into @pascal-app/nodes (fence/drafting.ts +
@@ -113,7 +119,6 @@ export { MoveTool } from './components/tools/item/move-tool'
 // `@pascal-app/nodes` (wall curve sagitta snap, door / window placement,
 // item drop) so kinds don't reach into editor internals.
 export {
-  calculateCursorRotation,
   calculateItemRotation,
   getSideFromNormal,
   isValidWallSideFace,
@@ -132,6 +137,7 @@ export {
   type PlacementCoordinatorConfig,
   usePlacementCoordinator,
 } from './components/tools/item/use-placement-coordinator'
+export { useRegistryToolContext } from './components/tools/registry-tool-context'
 export { CursorSphere } from './components/tools/shared/cursor-sphere'
 export { DragBoundingBox } from './components/tools/shared/drag-bounding-box'
 export { getFloorStackPreviewPosition } from './components/tools/shared/floor-stack-preview'
@@ -217,6 +223,7 @@ export {
   ViewToggles as ToolbarLeft,
   ViewToggles as ViewerToolbarLeft,
 } from './components/ui/action-menu/view-toggles'
+export { BatchLevelDialog } from './components/ui/batch-level-dialog'
 export { useCommandPalette } from './components/ui/command-palette'
 export { ActionButton, ActionGroup } from './components/ui/controls/action-button'
 export {
@@ -234,8 +241,10 @@ export { SegmentedControl } from './components/ui/controls/segmented-control'
 export { SliderControl } from './components/ui/controls/slider-control'
 export { TerrainSculptPanel } from './components/ui/controls/terrain-sculpt-panel'
 export { ToggleControl } from './components/ui/controls/toggle-control'
+export { ToolOptionsPanel } from './components/ui/controls/tool-options-panel'
 export { FloatingLevelSelector } from './components/ui/floating-level-selector'
 export { CATALOG_ITEMS } from './components/ui/item-catalog/catalog-items'
+export { LevelBatchDialogs } from './components/ui/level-batch-dialogs'
 // Item collections UI — used by the kind-owned ItemPanel in nodes/.
 export { CollectionsPopover } from './components/ui/panels/collections/collections-popover'
 // Phase 5 Stage E — kinds with bespoke editors (slab holes list,
@@ -254,6 +263,10 @@ export {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from './components/ui/primitives/dropdown-menu'
+export {
+  ShortcutToken,
+  shortcutDisplayValue,
+} from './components/ui/primitives/shortcut-token'
 export { useSidebarStore } from './components/ui/primitives/sidebar'
 export { Slider } from './components/ui/primitives/slider'
 export { SceneLoader } from './components/ui/scene-loader'
@@ -266,6 +279,7 @@ export {
   type SettingsPanelProps,
 } from './components/ui/sidebar/panels/settings-panel'
 export type { SitePanelProps } from './components/ui/sidebar/panels/site-panel'
+export { VerticalOverviewPanel } from './components/ui/sidebar/panels/vertical-overview-panel'
 export type { SidebarTab } from './components/ui/sidebar/tab-bar'
 export {
   resolveAssetSnapTarget,
@@ -274,6 +288,17 @@ export {
   SnapTargetBadge,
   SnapTargetIcon,
 } from './components/ui/snap-target-badge'
+export { TypicalFloorDialog } from './components/ui/typical-floor-dialog'
+export {
+  FloorplanCompassButton,
+  type FloorplanCompassButtonProps,
+} from './components/viewer/floorplan-compass-button'
+export {
+  FloorplanPreview,
+  type FloorplanPreviewProps,
+  type FloorplanPreviewScene,
+} from './components/viewer/floorplan-preview'
+export { useViewerCameraNavigationSync } from './components/viewer/use-viewer-camera-navigation-sync'
 export {
   ViewerControlsBar,
   type ViewerControlsBarProps,
@@ -282,6 +307,19 @@ export {
   ViewerSceneHeader,
   type ViewerSceneHeaderProps,
 } from './components/viewer/viewer-scene-header'
+export { ViewerStage, type ViewerStageProps } from './components/viewer/viewer-stage'
+export {
+  normalizeViewerStageModes,
+  resolveMobileViewerStageMode,
+  resolveViewerStageMode,
+  VIEWER_STAGE_MODES,
+  viewerStageIncludes3D,
+} from './components/viewer/viewer-stage-modes'
+export {
+  type ViewerStageMode,
+  ViewerStageSwitcher,
+  type ViewerStageSwitcherProps,
+} from './components/viewer/viewer-stage-switcher'
 export {
   WalkthroughHud,
   type WalkthroughHudProps,
@@ -310,6 +348,12 @@ export {
   resolveCeilingPlanPointSnap,
 } from './lib/ceiling-plan-snap'
 export { EDITOR_LAYER } from './lib/constants'
+export type { ContextualShortcutHint } from './lib/contextual-help'
+export {
+  CONTEXTUAL_HELP_NODE_EXTENSION_KEY,
+  type ContextualHelpNodeExtension,
+  getContextualHelpNodeExtension,
+} from './lib/contextual-help-extension'
 // Helper libs used by the kind-owned roof / stair / elevator panels.
 export {
   CONTINUATION_PROFILES,
@@ -318,6 +362,7 @@ export {
   continuationContextOf,
   nextContinuation,
 } from './lib/continuation'
+export { createEditorApi } from './lib/editor-api'
 export {
   clearStructuralElevationGuide,
   collectElevationSnapTargets,
@@ -325,6 +370,7 @@ export {
   type ElevationGuideSource,
   type ElevationSnapMatch,
   type ElevationSnapTarget,
+  publishResolvedElevationGuide,
   publishStructuralElevationGuide,
   resolveElevationSnapMatch,
   resolveStructuralElevationSnap,
@@ -335,6 +381,7 @@ export {
   resolveElevatorSupportLevelId,
   resolveElevatorSupportY,
 } from './lib/elevator-support'
+export { getFloatingMenuScale } from './lib/floating-menu-scale'
 // Floor-plan stair helpers — the cumulative-transform walk
 // (`computeFloorplanStairSegmentTransforms`) and the rich segment-entry
 // builder (`buildFloorplanStairEntry`) used by the kind-owned stair
@@ -360,6 +407,10 @@ export type {
   FloorplanAnnotationVisibility,
 } from './lib/floorplan/annotation-visibility'
 export {
+  exportFloorplanPdf,
+  type FloorplanExportScope,
+} from './lib/floorplan/floorplan-export'
+export {
   createFloorplanContextExtensions,
   FLOORPLAN_CONTEXT_EXTENSION_KEY,
   FLOORPLAN_GEOMETRY_METADATA_KEY,
@@ -384,23 +435,49 @@ export {
   type FloorplanMode,
   isFloorplanToolAvailableInMode,
 } from './lib/floorplan/floorplan-mode'
-export { commitFreshPlacementSubtree } from './lib/fresh-planar-placement'
+export {
+  commitFreshPlacementSubtree,
+  createFreshPlacementSubtree,
+} from './lib/fresh-planar-placement'
 export { exportSceneToGlb } from './lib/glb-export'
 export {
+  getHistoryCommandState,
   type HistoryCommandDelegate,
+  type HistoryCommandResult,
+  type HistoryCommandState,
   installHistoryCommandDelegate,
   runRedo,
   runUndo,
+  subscribeHistoryCommandState,
 } from './lib/history'
+export {
+  type EditorHostTreeChildren,
+  type EditorHostTreeChildrenProps,
+  editorHostTreeChildrenRegistry,
+  registerEditorHostTreeChildren,
+} from './lib/host-tree-children'
 export {
   boundaryReshapeScope,
   curveReshapeScope,
   endpointReshapeScope,
   holeEditScope,
+  meshEditScope,
   movingNodeOf,
   scopeNodeId,
 } from './lib/interaction/scope'
 export {
+  type BatchActionResult,
+  deleteLevelWithTypicalDetach,
+  runBatchLevelHeight,
+  runBatchLevels,
+  runDeriveTypicalInstances,
+  runLevelHeight,
+  runSetTypicalMaster,
+  runSyncTypicalInstances,
+} from './lib/level-batch-actions'
+export { deleteLevelWithFallbackSelection } from './lib/level-selection'
+export {
+  type ActivePaintMaterial,
   buildResetSurfaceMaterialUpdates,
   buildRoofSurfaceMaterialPatch,
   buildSingleSurfaceMaterialPatch,
@@ -483,6 +560,13 @@ export {
   type SlabPlanSnapInput,
   type SlabPlanSnapResult,
 } from './lib/slab-plan-snap'
+export {
+  getSnappingModeLabel,
+  resolveSnapFlags,
+  type SnapContext,
+  type SnapFlags,
+  type SnappingMode,
+} from './lib/snapping-mode'
 export { duplicateStairSubtree } from './lib/stair-duplication'
 export {
   getBuildingLevelsForLevel,
@@ -521,6 +605,7 @@ export {
 export { subscribeCameraPose } from './store/camera-pose-store'
 export { default as useAlignmentGuides } from './store/use-alignment-guides'
 export { default as useAudio } from './store/use-audio'
+export { type CameraHintAction, useCameraHintFocus } from './store/use-camera-hint-focus'
 export { type CommandAction, useCommandRegistry } from './store/use-command-registry'
 export {
   DRAWING_TYPE_OPTIONS,
@@ -529,17 +614,24 @@ export {
 export type {
   CaptureMode,
   FloorplanSelectionTool,
+  Mode,
   SnapshotCropMode,
   SnapshotStandardAspect,
   SplitOrientation,
+  StructureTool,
   Tool,
   ToolDefaults,
+  ToolMode,
   ViewMode,
   WorkspaceMode,
 } from './store/use-editor'
 export {
+  armMaterialPaint,
+  armToolMode,
   default as useEditor,
   getActiveContinuationContext,
+  getActiveSnapContext,
+  getActiveSnappingMode,
   getContinuation,
   isAlignmentGuideActive,
   isAngleSnapActive,
@@ -564,6 +656,7 @@ export {
   useMovingNode,
   useReshapingNode,
 } from './store/use-interaction-scope'
+export { pruneSelectedLevels, useLevelBatch } from './store/use-level-batch'
 export {
   commitMeasurementDraft,
   finishMeasurementDraft,

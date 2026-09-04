@@ -13,9 +13,11 @@ import {
 } from './../../../components/ui/primitives/sidebar'
 import { cn } from './../../../lib/utils'
 import useEditor from './../../../store/use-editor'
+import { LevelBatchDialogs } from './../level-batch-dialogs'
 import { type ExtraPanel, IconRail } from './icon-rail'
 import { SettingsPanel, type SettingsPanelProps } from './panels/settings-panel'
 import { SitePanel, type SitePanelProps } from './panels/site-panel'
+import { VerticalOverviewPanel } from './panels/vertical-overview-panel'
 import { useHostPanels } from './use-plugin-panels'
 
 interface AppSidebarProps {
@@ -42,6 +44,7 @@ export function AppSidebar({
   const setActivePanel = useEditor((s) => s.setActiveSidebarPanel)
   const hasActivePanel =
     activePanel === 'site' ||
+    activePanel === 'vertical' ||
     activePanel === 'settings' ||
     Boolean(extraPanels?.some((panel) => panel.id === activePanel))
 
@@ -63,6 +66,8 @@ export function AppSidebar({
     switch (activePanel) {
       case 'site':
         return <SitePanel {...sitePanelProps} />
+      case 'vertical':
+        return <VerticalOverviewPanel />
       case 'settings':
         return <SettingsPanel {...settingsPanelProps} />
       default: {
@@ -102,6 +107,7 @@ export function AppSidebar({
       </div>
       <EditorCommands />
       <CommandPalette emptyAction={commandPaletteEmptyAction} />
+      <LevelBatchDialogs />
     </>
   )
 }

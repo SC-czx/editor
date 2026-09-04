@@ -4,6 +4,7 @@ import {
   GROUND_SUPPORT_ID,
   type ItemNode,
   isLowProfileItemSurface,
+  nodeRegistry,
   sceneRegistry,
   spatialGridManager,
   useScene,
@@ -11,6 +12,8 @@ import {
 import { useViewer } from '@pascal-app/viewer'
 import { type Camera, Matrix3, type Object3D, Raycaster, Vector3 } from 'three'
 import { resolveTerrainGroundHit } from '../../../lib/ground-surface'
+import { scopeNodeId } from '../../../lib/interaction/scope'
+import useInteractionScope from '../../../store/use-interaction-scope'
 
 const originScratch = new Vector3()
 const hitScratch = new Vector3()
@@ -21,8 +24,6 @@ const worldRayDirection = new Vector3()
 const nodeTopRaycaster = new Raycaster()
 const nodeTopNormal = new Vector3()
 const nodeTopNormalMatrix = new Matrix3()
-
-const NODE_TOP_SURFACE_KINDS = ['wall', 'item', 'column'] as const
 
 export type PointerSupportSurface = {
   /** Level-local elevation of the pointed surface — the election cap. */
@@ -85,7 +86,19 @@ export function resolvePointerSupportSurface(
   // The world ray, kept before the level conversion below: the terrain field is
   // world-space (site geometry, not level-local), so the march needs this frame.
   camera.getWorldPosition(worldRayOrigin)
-  worldRayDirection.set(worldHit[0], worldHit[1], worldHit[2]).sub(worldRayOrigin)
+  const cameraToHit = hitScratch.set(worldHit[0], worldHit[1], worldHit[2]).sub(worldRayOrigin)
+  if ((camera as Camera & { isOrthographicCamera?: boolean }).isOrthographicCamera) {
+    // For an orthographic camera every screen pixel has the same direction. The
+    // hit point is offset from the camera along the view plane, so using
+    // `camera.position -> hit` tilts the ray toward the screen centre and makes
+    // support surfaces drift away from the cursor off-axis.
+    camera.getWorldDirection(worldRayDirection).normalize()
+    worldRayOrigin
+      .set(worldHit[0], worldHit[1], worldHit[2])
+      .addScaledVector(worldRayDirection, -cameraToHit.dot(worldRayDirection))
+  } else {
+    worldRayDirection.copy(cameraToHit).normalize()
+  }
 
   originScratch.copy(worldRayOrigin)
   hitScratch.set(worldHit[0], worldHit[1], worldHit[2])
@@ -151,16 +164,39 @@ export function resolvePointerSupportSurface(
     localPoint = [pointScratch.x, pointScratch.y, pointScratch.z]
   }
 
-  if (options?.includeNodeTopSurfaces) {
+  // Node tops are opt-in. A ray aimed at a floor crosses every upward-facing
+  // face above that floor first — a room's ceiling, the top of the wall it
+  // passes over — so electing "the nearest node top along the ray" silently
+  // lifts anything placed inside a finished room. Only the tools that build ON
+  // a surface (wall / column / fence / stair / block) mean that, and they say
+  // so. Everything else places against the floor the pointer indicates.
+  //
+  // `capabilities` is typed required on NodeDefinition, but this enumerates
+  // EVERY registered kind — including plugin bundles that bypass the type at
+  // runtime. A minimal definition without `capabilities` must read as "no top
+  // surface", not crash the resolver (night-8 CI, run 32580694134).
+  const nodeTopSurfaceKinds = options?.includeNodeTopSurfaces
+    ? Array.from(nodeRegistry.entries())
+        .filter(([, definition]) => definition.capabilities?.surfaces?.top !== undefined)
+        .map(([kind]) => kind)
+    : []
+  if (nodeTopSurfaceKinds.some((kind) => (sceneRegistry.byType[kind]?.size ?? 0) > 0)) {
     nodeTopRaycaster.set(worldRayOrigin, worldRayDirection.clone().normalize())
     const nodes = useScene.getState().nodes
     const registeredOwners = new Map(
       [...sceneRegistry.nodes.entries()].map(([nodeId, object]) => [object, nodeId as AnyNodeId]),
     )
-    const belongsToActiveLevel = (nodeId: AnyNodeId) => {
+    // The node the active interaction is placing/moving cannot be a surface for
+    // itself: its mesh rides the cursor, so electing its own top would raise it
+    // by its own height on every pointer move. Tools neuter the dragged mesh's
+    // `raycast` for their own pointer routing, but that is each tool's private
+    // convention — the election owns the invariant.
+    const interactingNodeId = scopeNodeId(useInteractionScope.getState().scope)
+    const isEligibleCandidate = (nodeId: AnyNodeId) => {
       let current = nodes[nodeId]
       const visited = new Set<AnyNodeId>()
       while (current && !visited.has(current.id)) {
+        if (current.id === interactingNodeId) return false
         if (current.id === levelId) return true
         visited.add(current.id)
         current = current.parentId ? nodes[current.parentId as AnyNodeId] : undefined
@@ -179,12 +215,12 @@ export function resolvePointerSupportSurface(
         }
       | undefined
 
-    for (const kind of NODE_TOP_SURFACE_KINDS) {
+    for (const kind of nodeTopSurfaceKinds) {
       for (const rawId of sceneRegistry.byType[kind] ?? []) {
         const nodeId = rawId as AnyNodeId
         const node = nodes[nodeId]
         const object = sceneRegistry.nodes.get(nodeId)
-        if (!(node?.visible && object?.visible && belongsToActiveLevel(nodeId))) continue
+        if (!(node?.visible && object?.visible && isEligibleCandidate(nodeId))) continue
         if (
           node.type === 'item' &&
           (!canHostOnTop(node) || isLowProfileItemSurface(node as ItemNode))

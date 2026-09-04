@@ -1,6 +1,6 @@
 'use client'
 
-import { Plus } from 'lucide-react'
+import { Plus, Ruler } from 'lucide-react'
 import type { ComponentType, ReactNode } from 'react'
 import {
   Tooltip,
@@ -27,19 +27,75 @@ interface IconRailProps {
   className?: string
 }
 
-const sitePanel: { id: PanelId; iconSrc: string; label: string } = {
+type RailPanel = { id: PanelId; label: string; iconSrc?: string; icon?: ReactNode }
+
+const sitePanel: RailPanel = {
   id: 'site',
   iconSrc: '/icons/level.webp',
   label: 'Site',
 }
 
-const settingsPanel: { id: PanelId; iconSrc: string; label: string } = {
+// Vertical overview: every level's ordinal, height, base elevation and
+// content counts in one table.
+const verticalPanel: RailPanel = {
+  id: 'vertical',
+  icon: <Ruler className="h-5 w-5" />,
+  label: 'Vertical overview',
+}
+
+const settingsPanel: RailPanel = {
   id: 'settings',
   iconSrc: '/icons/settings.webp',
   label: 'Settings',
 }
 
-const panels: { id: PanelId; iconSrc: string; label: string }[] = [sitePanel, settingsPanel]
+const panels: RailPanel[] = [sitePanel, verticalPanel, settingsPanel]
+
+function RailPanelButton({
+  panel,
+  isActive,
+  onSelect,
+}: {
+  panel: RailPanel
+  isActive: boolean
+  onSelect: (id: PanelId) => void
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          className={cn(
+            'flex h-9 w-9 items-center justify-center rounded-lg transition-all',
+            isActive ? 'bg-accent' : 'hover:bg-accent',
+          )}
+          onClick={() => onSelect(panel.id)}
+          type="button"
+        >
+          {panel.iconSrc ? (
+            <img
+              alt={panel.label}
+              className={cn(
+                'h-6 w-6 object-contain transition-all',
+                !isActive && 'opacity-50 saturate-0',
+              )}
+              src={panel.iconSrc}
+            />
+          ) : (
+            <span
+              className={cn(
+                'flex h-6 w-6 items-center justify-center transition-all',
+                !isActive && 'opacity-50',
+              )}
+            >
+              {panel.icon}
+            </span>
+          )}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="right">{panel.label}</TooltipContent>
+    </Tooltip>
+  )
+}
 
 export function IconRail({
   activePanel,
@@ -94,64 +150,26 @@ export function IconRail({
       <div className="mb-1 h-px w-8 bg-border/50" />
 
       {/* Site panel */}
-      {[sitePanel].map((panel) => {
-        const isActive = activePanel === panel.id
-        return (
-          <Tooltip key={panel.id}>
-            <TooltipTrigger asChild>
-              <button
-                className={cn(
-                  'flex h-9 w-9 items-center justify-center rounded-lg transition-all',
-                  isActive ? 'bg-accent' : 'hover:bg-accent',
-                )}
-                onClick={() => onPanelChange(panel.id)}
-                type="button"
-              >
-                <img
-                  alt={panel.label}
-                  className={cn(
-                    'h-6 w-6 object-contain transition-all',
-                    !isActive && 'opacity-50 saturate-0',
-                  )}
-                  src={panel.iconSrc}
-                />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right">{panel.label}</TooltipContent>
-          </Tooltip>
-        )
-      })}
+      {[sitePanel].map((panel) => (
+        <RailPanelButton
+          isActive={activePanel === panel.id}
+          key={panel.id}
+          onSelect={onPanelChange}
+          panel={panel}
+        />
+      ))}
 
       {regularExtraPanels?.map(renderExtraPanel)}
 
-      {/* Settings panel */}
-      {[settingsPanel].map((panel) => {
-        const isActive = activePanel === panel.id
-        return (
-          <Tooltip key={panel.id}>
-            <TooltipTrigger asChild>
-              <button
-                className={cn(
-                  'flex h-9 w-9 items-center justify-center rounded-lg transition-all',
-                  isActive ? 'bg-accent' : 'hover:bg-accent',
-                )}
-                onClick={() => onPanelChange(panel.id)}
-                type="button"
-              >
-                <img
-                  alt={panel.label}
-                  className={cn(
-                    'h-6 w-6 object-contain transition-all',
-                    !isActive && 'opacity-50 saturate-0',
-                  )}
-                  src={panel.iconSrc}
-                />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right">{panel.label}</TooltipContent>
-          </Tooltip>
-        )
-      })}
+      {/* Vertical overview + settings */}
+      {[verticalPanel, settingsPanel].map((panel) => (
+        <RailPanelButton
+          isActive={activePanel === panel.id}
+          key={panel.id}
+          onSelect={onPanelChange}
+          panel={panel}
+        />
+      ))}
 
       {(pluginPanels?.length || pluginsPanel) && (
         <div className="mt-1 flex w-9 flex-col items-center gap-1 border-border/70 border-t pt-2">

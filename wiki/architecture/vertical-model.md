@@ -11,13 +11,14 @@ The invariant, in one sentence:
 > that height and translating the wall from its elected base. Optional terrain infill
 > extends only the bottom; it never changes the authored wall height or top.
 
-**Sources**: `packages/core/src/services/storey.ts`, `packages/core/src/systems/wall/wall-top.ts`, `packages/core/src/systems/slab/slab-support.ts`, `packages/core/src/systems/stair/stair-rise.ts`, `packages/core/src/store/use-scene.ts` (migration Pass 3)
+**Sources**: `packages/core/src/services/storey.ts`, `packages/core/src/systems/wall/wall-top.ts`, `packages/core/src/systems/slab/slab-support.ts`, `packages/core/src/systems/stair/stair-rise.ts`, `packages/core/src/utils/vertical-scene-migration.ts`
 
 ## Stored truth
 
 | Field | Meaning | Absent means |
 |---|---|---|
-| `level.height` | Storey height in meters, floor-to-floor. Level world Y = per-building prefix sum of stored heights, ordered by the `level` ordinal (`getLevelElevations`). | Unmigrated legacy data (never seen post-load; the migration writes it). Consumers fall back to `DEFAULT_LEVEL_HEIGHT` (2.5). |
+| `level.height` | Storey height in meters, floor-to-floor. Level world Y is resolved by `getLevelElevations`, ordered by the `level` ordinal. | Unmigrated legacy data (never seen post-load; the migration writes it). Consumers fall back to `DEFAULT_LEVEL_HEIGHT` (2.5). |
+| `level.baseElevation` | Additive offset from the computed stack position. It shifts this level and cumulatively shifts every higher level in the same building; negative offsets are valid. | Zero (the schema default). |
 | `wall.height` | Explicit body height (half wall, parapet, or a raised-support draft whose ghost height must remain invariant). Ground-hosted walls always resolve top = elected base + height, including below datum; other legacy sunken supports retain their absolute-top constraint. | **Plane-bound** (the default for ordinary datum placement): the top follows `getWallPlaneTop` — `min(level height, lowest covering-slab underside over the span)`. |
 | `ceiling.height` | Explicit custom height, write-clamped to the bound. | **Follows the level**: resolves live to `getCeilingClampBound` = `min(level height, covering underside) − 0.01`. |
 | `slab.elevation` | The walking surface (top), level-local. | Default 0.05. |
@@ -25,12 +26,14 @@ The invariant, in one sentence:
 | `slab.recessed` | Recess intent: open shell whose floor is `elevation` and whose rim is `recessedRimElevation`. Excluded from "covering" queries and wall-face adoption. | Solid slab. |
 | `slab.recessedRimElevation` | Optional rim anchor for a raised/lowered recess. Relative presets preserve this anchor while changing depth. | Level plane (`0`), preserving legacy pools. |
 | `slab.fillToTerrain` | Adds a terrain-following perimeter foundation below a solid slab's fixed underside. The walking surface and authored structural thickness stay flat. | No terrain foundation. |
-| `supportSlabId` | Persisted support host on walls and all floor-placed kinds. Written at commit **only when overlapping supports disagree on elevation**; `'ground'` sentinel pins bare ground under a deck. | Support is elected per query (coverage election for walls, footprint max for items). |
+| `supportSlabId` | Persisted support host on walls and all floor-placed kinds. Written at commit **only when overlapping supports disagree on elevation**; `'ground'` sentinel pins bare ground under a deck. Structural blockes always pin their placement-time host so a room slab generated above them cannot feed back and lift the platform. | Support is elected per query (coverage election for walls, footprint max for items). |
 | `wall.supportOffset` | Optional level-local delta from the elected support. Terrain wall chains use it to keep every segment on the first point's construction plane while storing only one number, never terrain samples. | Zero offset: the wall sits directly on its elected slab or sculpted ground source. |
 | `fence.supportOffset` | Optional level-local delta from the fence's slab host or level plane. It translates the complete fence while preserving height. | Zero offset: the fence sits directly on its host or level plane. |
 | `wall.fillToTerrain` | Extends the wall downward from its authored base to the terrain with independently sampled left/right faces. The wall body height and top stay unchanged. | Fixed base with no terrain infill. |
 | `stair.deckSlabId` | Destination deck: rise follows `deck.elevation − the stair's own elected base` live; cutout sync disabled while attached. | Destination is a level. |
 | `stair.totalRise` | Explicit custom rise (wins over everything). | Follows: derived from the deck or the containing level; `syncStairRises` converges straight-stair segments to the resolved rise. |
+| `level.typicalMaster` | `true` marks the level as a typical-floor master: its structural content is the source of truth for every level pointing at it. | Ordinary level. |
+| `level.typicalMasterId` | For a derived instance: the master level's id. A level is never both a master and an instance — the load migration drops the contradiction. | Not an instance. |
 
 Two schema rules protect these semantics:
 
@@ -41,7 +44,7 @@ Two schema rules protect these semantics:
 
 | Helper | Home | Resolves |
 |---|---|---|
-| `getStoredLevelHeight`, `getLevelElevations`, `getLevelAbove/Below` | `services/storey.ts` | Level heights, per-building stacking, neighbors |
+| `getStoredLevelHeight`, `getLevelElevations`, `getLevelAbove/Below` | `services/storey.ts` | Level heights, offset-aware per-building stacking, neighbors |
 | `getWallPlaneTop` | `services/storey.ts` | A plane-bound wall's top: level height clamped to covering-slab undersides, span-sampled with boundary-inclusive band overlap |
 | `resolveWallTop`, `resolveWallEffectiveHeight`, `MIN_WALL_HEIGHT` | `systems/wall/wall-top.ts` | A wall's top / effective height given plane + elected base |
 | `getWallBaseElevationForNodes`, `getWallEffectiveHeightForNodes` | spatial-grid manager | The elected base and body height with terrain/support offsets, for UI overlays |
@@ -50,6 +53,9 @@ Two schema rules protect these semantics:
 | `resolveStairTotalRise`, `syncStairRises` | `systems/stair/stair-rise.ts` | Stair rise precedence + straight-flight convergence |
 | `computeWallSlabSupport`, `getSlabSupportForItem`, `getSupportCandidatesForFootprint` | `systems/slab/slab-support.ts` + spatial-grid manager | Support election (rendered polygons, host-preferring, optional `maxElevation` cap) |
 | `resolveSlabPlacementElevation` | `systems/slab/slab-placement.ts` | Translates a solid slab's authored top/thickness interval onto a captured base plane; recessed slabs stay level-relative |
+| `planBatchLevels`, `planLevelHeightUpdates`, `validateBatchLevelRequest` | `services/storey-batch.ts` | Multi-storey batch planning: block creation (append / rebuild) and batch height edits with plane-following linkage |
+| `planTypicalFloorInstances`, `planSyncTypicalFloorInstances`, `planDetachTypicalInstances` | `services/typical-floor.ts` | Typical-floor master → instance derivation, structural sync, and detachment |
+| `getStoreyOverviewRows` | `services/storey-batch.ts` | Tabular vertical overview (ordinal, height, cumulative base elevation, content counts) |
 | `getSlabBaseElevation`, `applySlabBaseElevationChange`, `applySlabThicknessChange` | `nodes/slab/elevation-limit.ts` | Separates whole-body underside placement from fixed-base thickness editing |
 | `resolveFenceLiftElevation` | `nodes/fence/lift.ts` | Fence slab-host elevation plus its optional manual support offset |
 | `clampSlabElevationForWalls` | slab-support + `nodes/slab/elevation-limit.ts` | Slab top clamp under plane-bound walls |
@@ -65,7 +71,7 @@ Two schema rules protect these semantics:
 
 ## Pointer-decided placement
 
-Grid events intersect a plane that rides the ghost's elevation, so any stacked-surface decision must come from the true camera ray, not the plane hit: `getPointedSupportSurface` returns the nearest eligible surface plus the crossing point, and both the support-election cap (`maxElevation`) and the cursor XZ derive from that single computation. Pointing under a deck elects the floor; pointing at the deck top elects the deck. Wall drafting may additionally include upward-facing wall, stackable-item, and column meshes. Those node-top hits freeze a scalar construction plane for the throw; they are not a persistent hosting edge and do not follow later host edits. Commits persist the elected slab/ground source plus `wall.supportOffset`. 2D floorplan placement has no camera ray and keeps max-election.
+Grid events intersect a plane that rides the ghost's elevation, so any stacked-surface decision must come from the true camera ray, not the plane hit: `getPointedSupportSurface` returns the nearest eligible surface plus the crossing point, and both the support-election cap (`maxElevation`) and the cursor XZ derive from that single computation. Pointing under a deck elects the floor; pointing at the deck top elects the deck. Upward-facing block geometry is a shared placement surface for slabs, fences, columns, stairs, items, and registry-driven floor objects; wall drafting may additionally include upward-facing wall, stackable-item, and column geometry. Those node-top hits freeze a scalar construction plane for the throw; they are not a persistent hosting edge and do not follow later host edits. Slabs store the plane as `elevation`, walls and fences as `supportOffset`, and floor-placed position nodes as their canonical Y offset. Each also pins the slab or ground beneath the block, preventing a later generated slab from feeding back and lifting the placed object. Ordinary slab/ground hits persist their elected support source and retain the normal stepped-base behavior. 2D floorplan placement has no camera ray and keeps max-election.
 
 Wall and slab drafting share the horizontal construction-plane resolver. A slab freezes the
 first snapped vertex's plane, keeps later vertices on that flat plane, and translates its authored
@@ -121,9 +127,33 @@ free: `FloorElevationSystem` writes to the node's registered object, which for t
 selection proxy, not the instance. Such renderers must resolve each instance's Y through
 `getFloorStackedPosition` themselves.
 
-## Load migration (lives in `migrateNodes` Pass 3, indefinitely)
+## Multi-storey batches and typical floors
 
-Because community autosave only persists after the first post-load edit, the migration must remain in `migrateNodes`:
+A batch is planned, then applied once. Every planner in `services/storey-batch.ts` and
+`services/typical-floor.ts` is pure and returns a `StoreyBatchChange` (`create` / `update` /
+`delete`); the editor applies it with a single `applyNodeChanges` call inside
+`runAsSingleSceneHistoryStep`, so one batch is one undo entry — including the stair-rise and
+auto-opening follow-ups that run a microtask later with history paused.
+
+- **Batch creation** numbers the new block from the building's current top (`append`) or from
+  scratch (`rebuild`), and always guarantees an ordinal-0 ground floor. Heights come from
+  `resolveAboveGroundBlockHeights`: first / middle / last, plus one height for basements.
+- **Batch height edits** write `height` on the ticked levels only. Levels above are *not*
+  touched — `getLevelElevations` stacks them from the stored heights, so they translate on
+  their own, typical-floor instances included. What *is* rewritten is the geometry that has to
+  follow the plane: explicit-height walls whose top sat on the old plane, ceilings sitting on
+  their clamp bound, and stairs whose explicit `totalRise` tracked the floor-to-floor rise
+  (with their flight segments). Follows-mode stairs need no write — `syncStairRises` converges
+  them after the commit.
+- **Typical floors**: an instance is a full copy of the master minus scans, guides and spawn
+  anchors. A sync deletes the structural content the instance inherited last time and grafts a
+  fresh copy of the master's. Anything not in `TYPICAL_FLOOR_STRUCTURAL_TYPES` — furniture,
+  annotations, MEP — is never touched, so items the user drops on an instance survive every
+  later sync. Deleting a master detaches its instances in the same undo step.
+
+## Load migration (lives in `migrateVerticalSceneNodes`, indefinitely)
+
+Because community autosave only persists after the first post-load edit, the migration must remain on the load path. It is pure and server-safe so the editor loader and hosted scene authority canonicalize identical fields before collaboration compares or persists an operation:
 
 - Writes each legacy level's **exact** derived height (a default legacy storey stores 2.55 = 0.05 slab + 2.5 wall) — never snapped to presets.
 - Compacts `level` ordinals per building, anchored at zero (non-negatives → 0,1,2…; negatives → −1,−2… — basements stay basements). Runs every load; idempotent.

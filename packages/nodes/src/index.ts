@@ -1,4 +1,5 @@
 import type { AnyNodeDefinition, Plugin } from '@pascal-app/core'
+import { blockDefinition } from './block/definition'
 import { boxVentDefinition } from './box-vent'
 import { buildingDefinition } from './building'
 import { cabinetDefinition, cabinetModuleDefinition } from './cabinet'
@@ -20,6 +21,7 @@ import { guideDefinition } from './guide'
 import { gutterDefinition } from './gutter'
 import { hvacEquipmentDefinition } from './hvac-equipment'
 import { itemDefinition } from './item'
+import { leanToExtensionDefinition } from './lean-to-extension'
 import { levelDefinition } from './level'
 import { linesetDefinition } from './lineset'
 import { liquidLineDefinition } from './liquid-line'
@@ -67,8 +69,10 @@ export const builtinPlugin: Plugin = {
   nodes: [
     // Stage E-complete (full registry path)
     shelfDefinition as unknown as AnyNodeDefinition,
+    blockDefinition as unknown as AnyNodeDefinition,
     spawnDefinition as unknown as AnyNodeDefinition,
     wallDefinition as unknown as AnyNodeDefinition,
+    leanToExtensionDefinition as unknown as AnyNodeDefinition,
     fenceDefinition as unknown as AnyNodeDefinition,
     slabDefinition as unknown as AnyNodeDefinition,
     ceilingDefinition as unknown as AnyNodeDefinition,
@@ -120,16 +124,32 @@ export const builtinPlugin: Plugin = {
   ],
 }
 
+export {
+  applyBlockCommand,
+  type BlockCommand,
+  type BlockCommandResult,
+  type BlockSelection,
+  blockFaceCentroid,
+  blockFaceNormal,
+} from './block/commands'
+export { blockDefinition } from './block/definition'
 export { boxVentDefinition } from './box-vent'
 export { buildingDefinition } from './building'
 export {
   bakeCabinetAnimationClip,
+  CABINET_PLANNING_TOLERANCE,
   type CabinetPlacementType,
+  type CabinetPlanningIssue,
+  type CabinetPlanningIssueCode,
+  type CabinetPlanningOptions,
+  type CabinetPlanningReport,
   cabinetDefinition,
   cabinetModuleDefinition,
+  MIN_PRACTICAL_TOP_CABINET_HEIGHT,
   poseCabinetMovingParts,
   useCabinetPlacementStatus,
   useCabinetPlacementType,
+  validateCabinetRun,
 } from './cabinet'
 export { ceilingDefinition } from './ceiling'
 export { chimneyDefinition } from './chimney'
@@ -149,6 +169,7 @@ export { guideDefinition } from './guide'
 export { gutterDefinition } from './gutter'
 export { hvacEquipmentDefinition } from './hvac-equipment'
 export { itemDefinition } from './item'
+export { leanToExtensionDefinition } from './lean-to-extension'
 export { levelDefinition } from './level'
 export { linesetDefinition } from './lineset'
 export { liquidLineDefinition, useLiquidLineToolOptions } from './liquid-line'
@@ -157,7 +178,7 @@ export { pipeFittingDefinition } from './pipe-fitting'
 export { pipeSegmentDefinition } from './pipe-segment'
 export { pipeTrapDefinition } from './pipe-trap'
 export { ridgeVentDefinition } from './ridge-vent'
-export { roofDefinition } from './roof'
+export { type RoofFootprintSourceChoice, roofDefinition, useRoofFootprintSource } from './roof'
 export { roofSegmentDefinition } from './roof-segment'
 export { scanDefinition } from './scan'
 export { shelfDefinition } from './shelf'

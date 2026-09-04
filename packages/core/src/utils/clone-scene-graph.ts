@@ -6,11 +6,13 @@ import {
 import type { AnyNode, AnyNodeId } from '../schema'
 import { generateId } from '../schema/base'
 import type { Collection, CollectionId } from '../schema/collections'
+import type { SceneMaterial, SceneMaterialId } from '../schema/scene-material'
 
 export type SceneGraph = {
   nodes: Record<AnyNodeId, AnyNode>
   rootNodeIds: AnyNodeId[]
   collections?: Record<CollectionId, Collection>
+  materials?: Record<SceneMaterialId, SceneMaterial>
   installedPlugins?: string[]
 }
 
@@ -32,7 +34,7 @@ function extractIdPrefix(id: string): string {
  * - Multi-scene in-memory scenarios
  */
 export function cloneSceneGraph(sceneGraph: SceneGraph): SceneGraph {
-  const { nodes, rootNodeIds, collections, installedPlugins } = sceneGraph
+  const { nodes, rootNodeIds, collections, materials, installedPlugins } = sceneGraph
 
   // Build ID mapping: old ID -> new ID
   const idMap = new Map<string, string>()
@@ -87,6 +89,23 @@ export function cloneSceneGraph(sceneGraph: SceneGraph): SceneGraph {
       ;(clonedNode as Record<string, unknown>).roofSegmentId = idMap.get(
         clonedNode.roofSegmentId,
       ) as string | undefined
+    }
+
+    if ('hostRoofId' in clonedNode && typeof clonedNode.hostRoofId === 'string') {
+      ;(clonedNode as Record<string, unknown>).hostRoofId = idMap.get(clonedNode.hostRoofId) as
+        | string
+        | undefined
+    }
+
+    if ('hostRoofSegmentId' in clonedNode && typeof clonedNode.hostRoofSegmentId === 'string') {
+      ;(clonedNode as Record<string, unknown>).hostRoofSegmentId = idMap.get(
+        clonedNode.hostRoofSegmentId,
+      ) as string | undefined
+    }
+
+    if (clonedNode.type === 'roof' && clonedNode.support?.kind === 'roof') {
+      clonedNode.support.roofSegmentId = (idMap.get(clonedNode.support.roofSegmentId) ??
+        clonedNode.support.roofSegmentId) as typeof clonedNode.support.roofSegmentId
     }
 
     // Remap supportSlabId (persisted slab-support hosts). The 'ground'
@@ -164,6 +183,12 @@ export function cloneSceneGraph(sceneGraph: SceneGraph): SceneGraph {
     nodes: clonedNodes,
     rootNodeIds: clonedRootNodeIds,
     ...(clonedCollections && { collections: clonedCollections }),
+    // Material ids are deliberately *not* remapped. Nodes point at these
+    // through `slots` values shaped `scene:mat_…` — opaque strings that the
+    // node remapping above copies verbatim, since `idMap` only covers node
+    // ids. Minting fresh material ids here would orphan every one of those
+    // refs and the clone would render with default materials.
+    ...(materials && { materials: structuredClone(materials) }),
     ...(installedPlugins && { installedPlugins: [...installedPlugins] }),
   }
 }
@@ -264,6 +289,21 @@ export function cloneLevelSubtree(
         idMap.get(cloned.roofSegmentId) ?? cloned.roofSegmentId
     }
 
+    if ('hostRoofId' in cloned && typeof cloned.hostRoofId === 'string') {
+      ;(cloned as Record<string, unknown>).hostRoofId =
+        idMap.get(cloned.hostRoofId) ?? cloned.hostRoofId
+    }
+
+    if ('hostRoofSegmentId' in cloned && typeof cloned.hostRoofSegmentId === 'string') {
+      ;(cloned as Record<string, unknown>).hostRoofSegmentId =
+        idMap.get(cloned.hostRoofSegmentId) ?? cloned.hostRoofSegmentId
+    }
+
+    if (cloned.type === 'roof' && cloned.support?.kind === 'roof') {
+      cloned.support.roofSegmentId = (idMap.get(cloned.support.roofSegmentId) ??
+        cloned.support.roofSegmentId) as typeof cloned.support.roofSegmentId
+    }
+
     // Remap supportSlabId when the host slab is inside the cloned subtree;
     // preserve it otherwise (like wallId, the reference may point outside).
     if ('supportSlabId' in cloned && typeof cloned.supportSlabId === 'string') {
@@ -304,7 +344,7 @@ export function forkSceneGraph(
     return cloneSceneGraph(sceneGraph)
   }
 
-  const { nodes, rootNodeIds, collections, installedPlugins } = sceneGraph
+  const { nodes, rootNodeIds, collections, materials, installedPlugins } = sceneGraph
 
   // First, identify scan and guide node IDs to exclude (user-uploaded imagery)
   const excludedNodeIds = new Set<string>()
@@ -366,6 +406,11 @@ export function forkSceneGraph(
     nodes: filteredNodes,
     rootNodeIds: filteredRootNodeIds,
     ...(filteredCollections && { collections: filteredCollections }),
+    // Kept whole rather than filtered to the surviving nodes: a palette entry
+    // is authored content in its own right, and dropping the scan node that
+    // happened to be its only user would silently delete a material the fork's
+    // owner can still pick from the palette.
+    ...(materials && { materials }),
     ...(installedPlugins && { installedPlugins }),
   })
 }
